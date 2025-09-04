@@ -392,6 +392,25 @@ common_close_account( fd_pubkey_t *         authority_address,
 }
 
 
+/* A CPI recurses through fd_bpf_execute, so one frame per instruction stack
+   level sits on the tile's native stack and the whole nest must fit within
+   FD_TILE_PRIVATE_STACK_SZ.  Overflow lands on the guard page as a SIGSEGV
+   rather than a clean error, so the budget is checked at compile time.
+   Measured frames: fd_bpf_execute 584 KiB, cpi syscall 32 KiB,
+   prepare_instruction 5 KiB -- ~621 KiB per level, so depth 9 uses 5.5 MiB
+   of 8 MiB where depth 5 used 3.0 MiB. */
+
+#define FD_BPF_EXECUTE_STACK_EST                                          \
+  ( sizeof(fd_vm_t)                       /* _vm[1]             */      + \
+    1000UL*sizeof(fd_vm_input_region_t)   /* input_mem_regions  */      + \
+    256UL *sizeof(fd_vm_acc_region_meta_t)/* acc_region_metas   */      + \
+    256UL *sizeof(ulong)                  /* pre_lens           */      + \
+    FD_SBPF_SYSCALLS_FOOTPRINT            /* syscalls_mem       */      + \
+    (64UL<<10)                            /* intervening frames */      )
+
+FD_STATIC_ASSERT( FD_MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268*FD_BPF_EXECUTE_STACK_EST +
+                  (768UL<<10) < FD_TILE_PRIVATE_STACK_SZ, tile_stack_budget );
+
 /* Every loader-owned BPF program goes through this function, which goes into the VM.
 
    https://github.com/anza-xyz/agave/blob/574bae8fefc0ed256b55340b9d87b7689bcdf222/programs/bpf_loader/src/lib.rs#L1332-L1501 */
