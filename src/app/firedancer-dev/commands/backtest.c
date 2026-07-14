@@ -20,6 +20,7 @@
 #include "../../../disco/topo/fd_topob.h"
 #include "../../../util/pod/fd_pod_format.h"
 #include "../../../disco/gui/fd_gui_config_parse.h"
+#include "../../../disco/diag/fd_diag_tile.h"
 #include "../../../ballet/base58/fd_base58.h"
 #include "../../../disco/genesis/fd_genesis_cluster.h"
 #include "../../../discof/genesis/fd_genesi_tile.h"
@@ -320,6 +321,11 @@ backtest_topo( config_t * config ) {
     fd_topob_wksp( topo, "gui" );
     fd_topo_tile_t * gui_tile = fd_topob_tile( topo, "gui", "gui", "metric_in", cpu_idx++, 0, 1, 0 );
 
+    fd_topob_wksp( topo, "diag_gui" );
+    fd_topob_link( topo, "diag_gui", "diag_gui", 4UL, sizeof(fd_diag_system_resources_t), 1UL );
+    fd_topob_tile_out( topo, "diag", 0UL, "diag_gui", 0UL );
+    fd_topob_tile_in( topo, "gui", 0UL, "metric_in", "diag_gui", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+
     fd_topob_wksp( topo, "snapct_gui" );
     fd_topob_wksp( topo, "snapin_gui" );
     fd_topob_link( topo, "snapct_gui", "snapct_gui", 128UL, sizeof(fd_snapct_update_t),            1UL );
@@ -383,7 +389,7 @@ backtest_topo( config_t * config ) {
 
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
     fd_topo_tile_t * tile = &topo->tiles[ i ];
-    fd_topo_configure_tile( tile, config );
+    fd_topo_configure_tile( topo, tile, config );
 
     if( FD_UNLIKELY( !strcmp( tile->name, "gui" ) ) ) {
       tile->gui.tile_cnt = topo->tile_cnt;

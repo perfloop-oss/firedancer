@@ -20,6 +20,7 @@
 #include "../../disco/topo/fd_topob.h"
 #include "../../disco/topo/fd_cpu_topo.h"
 #include "../../disco/bundle/fd_bundle_tile.h"
+#include "../../disco/diag/fd_diag_tile.h"
 #include "../../util/pod/fd_pod_format.h"
 #include "../../discof/restore/utils/fd_ssctrl.h"
 #include "../../discof/restore/utils/fd_ssmsg.h"
@@ -284,6 +285,7 @@ fd_topo_initialize( config_t * config ) {
   }
 
   fd_topob_wksp( topo, "metric_in"    );
+  if( FD_LIKELY( config->tiles.gui.enabled ) ) fd_topob_wksp( topo, "diag_gui" );
 
   fd_topob_wksp( topo, "net_gossip"   );
   fd_topob_wksp( topo, "net_shred"    );
@@ -476,6 +478,8 @@ fd_topo_initialize( config_t * config ) {
   /**/                 fd_topob_link( topo, "txsend_out",    "txsend_out",    128UL,                                    FD_TPU_RAW_MTU,                1UL );
 
   FOR(execrp_tile_cnt) fd_topob_link( topo, "execrp_replay", "execrp_replay", 16384UL,                                  sizeof(fd_execrp_task_done_msg_t), 1UL );
+  if( FD_LIKELY( config->tiles.gui.enabled ) )
+    fd_topob_link( topo, "diag_gui", "diag_gui", 4UL, sizeof(fd_diag_system_resources_t), 1UL );
 
   ushort parsed_tile_to_cpu[ FD_TILE_MAX ];
   /* Unassigned tiles will be floating, unless auto topology is enabled. */
@@ -512,6 +516,8 @@ fd_topo_initialize( config_t * config ) {
   /*                                  topo, tile_name, tile_wksp, metrics_wksp, cpu_idx,                       is_agave, uses_id_keyswitch, uses_av_keyswitch */
   /**/                 fd_topob_tile( topo, "metric",  "metric",  "metric_in",  tile_to_cpu[ topo->tile_cnt ], 0,        0,                 0 );
   /**/                 fd_topob_tile( topo, "diag",    "diag",    "metric_in",  tile_to_cpu[ topo->tile_cnt ], 0,        0,                 0 );
+  if( FD_LIKELY( config->tiles.gui.enabled ) )
+    fd_topob_tile_out( topo, "diag", 0UL, "diag_gui", 0UL );
 
   if( FD_LIKELY( snapshots_enabled ) ) {
     /**/               fd_topob_tile( topo, "snapct", "snapct", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
@@ -990,6 +996,7 @@ fd_topo_initialize( config_t * config ) {
     /**/                   fd_topob_tile_in(  topo, "gui",    0UL,           "metric_in", "replay_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                   fd_topob_tile_in(  topo, "gui",    0UL,           "metric_in", "replay_epoch",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                   fd_topob_tile_in(  topo, "gui",    0UL,           "metric_in", "genesi_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    /**/                   fd_topob_tile_in(  topo, "gui",    0UL,           "metric_in", "diag_gui",      0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
     if( leader_enabled ) {
       /**/                 fd_topob_tile_in(  topo, "gui",    0UL,           "metric_in", "pack_poh",      0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
       /**/                 fd_topob_tile_in(  topo, "gui",    0UL,           "metric_in", "pack_execle",   0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
@@ -1178,7 +1185,7 @@ fd_topo_initialize( config_t * config ) {
   fd_pod_insert_int( topo->props, "sandbox", config->development.sandbox ? 1 : 0 );
 
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
-    fd_topo_configure_tile( &topo->tiles[ i ], config );
+    fd_topo_configure_tile( topo, &topo->tiles[ i ], config );
     if( FD_UNLIKELY( !strcmp( topo->tiles[ i ].name, "gui" ) ) ) topo->tiles[ i ].gui.tile_cnt = topo->tile_cnt;
   }
 
@@ -1201,13 +1208,26 @@ parse_listen_addr( char const *    cstr,
 }
 
 void
-fd_topo_configure_tile( fd_topo_tile_t * tile,
+fd_topo_configure_tile( fd_topo_t *      topo,
+                        fd_topo_tile_t * tile,
                         fd_config_t *    config ) {
   if( FD_UNLIKELY( !strcmp( tile->name, "metric" ) ) ) {
 
     if( FD_UNLIKELY( !fd_cstr_to_ip4_addr( config->tiles.metric.prometheus_listen_address, &tile->metric.prometheus_listen_addr ) ) )
       FD_LOG_ERR(( "failed to parse prometheus listen address `%s`", config->tiles.metric.prometheus_listen_address ));
     tile->metric.prometheus_listen_port = config->tiles.metric.prometheus_listen_port;
+
+  } else if( FD_UNLIKELY( !strcmp( tile->name, "diag" ) ) ) {
+
+    tile->diag.is_voting        = strcmp( config->paths.vote_account, "" );
+    tile->diag.gui_enabled      = fd_topo_find_tile_out_link( topo, tile, "diag_gui", 0UL )!=ULONG_MAX;
+    tile->diag.no_clone         = config->development.no_clone;
+
+    fd_cstr_ncpy( tile->diag.shreds_path,    config->tiles.rserve.enabled                         ? config->paths.shredb    : "", sizeof(tile->diag.shreds_path)    );
+    fd_cstr_ncpy( tile->diag.snapshots_path, config->firedancer.layout.enable_snapshot_production ? config->paths.snapshots : "", sizeof(tile->diag.snapshots_path) );
+    fd_cstr_ncpy( tile->diag.accounts_path,  config->paths.accounts,  sizeof(tile->diag.accounts_path) );
+    fd_cstr_ncpy( tile->diag.gui_path,       config->paths.guidb,     sizeof(tile->diag.gui_path)      );
+    fd_cstr_ncpy( tile->diag.log_path,       config->log.path,        sizeof(tile->diag.log_path)      );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "event" ) ) ) {
 
@@ -1603,9 +1623,6 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     for( ulong i=0UL; i<tile->sign.authorized_voter_paths_cnt; i++ ) {
       fd_cstr_ncpy( tile->sign.authorized_voter_paths[ i ], config->firedancer.paths.authorized_voter_paths[ i ], sizeof(tile->sign.authorized_voter_paths[ i ]) );
     }
-
-  } else if( FD_UNLIKELY( !strcmp( tile->name, "diag" ) ) ) {
-    tile->diag.is_voting = strcmp( config->paths.vote_account, "" );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "gui" ) ) ) {
 

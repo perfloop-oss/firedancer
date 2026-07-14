@@ -60,7 +60,8 @@ setup_topo_txncache( fd_topo_t *  topo,
                      int          larger_max_cost_per_block );
 
 void
-fd_topo_configure_tile( fd_topo_tile_t * tile,
+fd_topo_configure_tile( fd_topo_t *      topo,
+                        fd_topo_tile_t * tile,
                         fd_config_t *    config );
 
 void

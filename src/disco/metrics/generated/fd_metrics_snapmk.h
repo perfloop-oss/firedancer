@@ -22,6 +22,7 @@ enum {
   FD_METRICS_COUNTER_SNAPMK_COMPRESS_DURATION_SECONDS_OFF,
   FD_METRICS_GAUGE_SNAPMK_INCREMENTAL_ACCOUNT_COUNT_OFF,
   FD_METRICS_GAUGE_SNAPMK_INCREMENTAL_ACCOUNT_CAPACITY_OFF,
+  FD_METRICS_GAUGE_SNAPMK_DISK_ALLOCATED_BYTES_OFF,
 };
 
 #define FD_METRICS_COUNTER_SNAPMK_SNAPSHOTS_CREATED_NAME "snapmk_snapshots_created"
@@ -72,7 +73,12 @@ enum {
 #define FD_METRICS_GAUGE_SNAPMK_INCREMENTAL_ACCOUNT_CAPACITY_DESC "Maximum number of changed accounts that can be tracked.  Once the count reaches this limit, incremental snapshots can no longer be created until the next full snapshot"
 #define FD_METRICS_GAUGE_SNAPMK_INCREMENTAL_ACCOUNT_CAPACITY_CVT  (FD_METRICS_CONVERTER_NONE)
 
-#define FD_METRICS_SNAPMK_TOTAL (12UL)
+#define FD_METRICS_GAUGE_SNAPMK_DISK_ALLOCATED_BYTES_NAME "snapmk_disk_allocated_bytes"
+#define FD_METRICS_GAUGE_SNAPMK_DISK_ALLOCATED_BYTES_TYPE (FD_METRICS_TYPE_GAUGE)
+#define FD_METRICS_GAUGE_SNAPMK_DISK_ALLOCATED_BYTES_DESC "Logical bytes allocated across managed snapshot files, including partial and retained files"
+#define FD_METRICS_GAUGE_SNAPMK_DISK_ALLOCATED_BYTES_CVT  (FD_METRICS_CONVERTER_NONE)
+
+#define FD_METRICS_SNAPMK_TOTAL (13UL)
 extern const fd_metrics_meta_t FD_METRICS_SNAPMK[FD_METRICS_SNAPMK_TOTAL];
 
 #endif /* HEADER_fd_src_disco_metrics_generated_fd_metrics_snapmk_h */

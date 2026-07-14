@@ -1,6 +1,8 @@
 #ifndef HEADER_fd_src_disco_diag_fd_diag_tile_h
 #define HEADER_fd_src_disco_diag_fd_diag_tile_h
 
+#include "../fd_disco_base.h"
+
 #define FD_DIAG_BUNDLE_STATUS_DISABLED     (0UL) /* No bundle tiles configured */
 #define FD_DIAG_BUNDLE_STATUS_DISCONNECTED (1UL) /* All bundle tiles disconnected */
 #define FD_DIAG_BUNDLE_STATUS_CONNECTING   (2UL) /* At least one bundle tile connecting, none connected or sleeping */
@@ -22,5 +24,72 @@
 #define FD_DIAG_TURBINE_STATUS_STALLED          (2UL) /* Turbine slot not advancing */
 #define FD_DIAG_TURBINE_STATUS_REPAIR_OUTPACING (3UL) /* Repair byte throughput exceeds turbine */
 #define FD_DIAG_TURBINE_STATUS_RUNNING          (4UL) /* Turbine receiving normally */
+
+#define FD_DIAG_SYSTEM_CPU_MAX      (1024UL)
+#define FD_DIAG_SYSTEM_NUMA_MAX     (64UL)
+#define FD_DIAG_SYSTEM_TILE_MAX     (256UL)
+#define FD_DIAG_SYSTEM_TILE_MEM_MAX (FD_DIAG_SYSTEM_TILE_MAX*FD_DIAG_SYSTEM_NUMA_MAX)
+
+#define FD_DIAG_SYSTEM_DATA_ACCOUNTS  ( 0U)
+#define FD_DIAG_SYSTEM_DATA_SHREDS    ( 1U)
+#define FD_DIAG_SYSTEM_DATA_SNAPSHOTS ( 2U)
+#define FD_DIAG_SYSTEM_DATA_GUI       ( 3U)
+#define FD_DIAG_SYSTEM_DATA_LOGS      ( 4U)
+#define FD_DIAG_SYSTEM_DATA_CNT       (5UL)
+
+struct fd_diag_system_cpu {
+  ushort cpu_idx;
+  ushort numa_idx;
+  ushort sibling_idx; /* USHORT_MAX when unavailable/offline */
+  uchar  online;
+};
+typedef struct fd_diag_system_cpu fd_diag_system_cpu_t;
+
+struct fd_diag_system_numa_mem {
+  ushort numa_idx;
+  ulong  total_bytes;
+  ulong  free_bytes;
+  ulong  shared_bytes;
+};
+typedef struct fd_diag_system_numa_mem fd_diag_system_numa_mem_t;
+
+struct fd_diag_system_tile_mem {
+  ushort tile_idx;
+  ushort numa_idx;
+  ulong  resident_bytes;
+};
+typedef struct fd_diag_system_tile_mem fd_diag_system_tile_mem_t;
+
+struct fd_diag_system_mount {
+  char  path[ PATH_MAX ];
+  ulong total_bytes;
+  ulong free_bytes;
+  ulong available_bytes;
+};
+typedef struct fd_diag_system_mount fd_diag_system_mount_t;
+
+struct fd_diag_system_disk {
+  uint  category;
+  uint  mount_idx;
+  ulong bytes;
+};
+typedef struct fd_diag_system_disk fd_diag_system_disk_t;
+
+struct fd_diag_system_resources {
+  ulong                     sample_time_nanos;
+  uint                      cpu_cnt;
+  ulong                     mem_available_bytes;
+  ulong                     mem_free_bytes;
+  uint                      numa_mem_cnt;
+  uint                      tile_mem_cnt;
+  uint                      mount_cnt;
+  uint                      disk_cnt;
+  fd_diag_system_cpu_t      cpu     [ FD_DIAG_SYSTEM_CPU_MAX      ];
+  fd_diag_system_numa_mem_t numa_mem[ FD_DIAG_SYSTEM_NUMA_MAX     ];
+  fd_diag_system_tile_mem_t tile_mem[ FD_DIAG_SYSTEM_TILE_MEM_MAX ];
+  fd_diag_system_mount_t    mount   [ FD_DIAG_SYSTEM_DATA_CNT     ];
+  fd_diag_system_disk_t     disk    [ FD_DIAG_SYSTEM_DATA_CNT     ];
+};
+typedef struct fd_diag_system_resources fd_diag_system_resources_t;
 
 #endif /* HEADER_fd_src_disco_diag_fd_diag_tile_h */

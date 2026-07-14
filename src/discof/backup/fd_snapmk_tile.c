@@ -128,8 +128,9 @@ struct fd_snapmk {
   uint snap_idx; /* in pool */
   uint snap_max;
   uint snap_full_max; /* <=snap_max */
-  fd_backup_inode_t pool[ FD_SNAP_MAX ];
-  ulong final_sz;
+  fd_backup_inode_t pool   [ FD_SNAP_MAX ];
+  ulong             pool_sz[ FD_SNAP_MAX ];
+  ulong             final_sz;
 
   /* snapzp worker threads */
 
@@ -255,6 +256,7 @@ struct fd_snapmk {
 };
 
 typedef struct fd_snapmk fd_snapmk_t;
+
 
 #define IN_KIND_REPLAY 1
 #define IN_KIND_SNAPRD 2
@@ -572,6 +574,7 @@ zip_flush( fd_snapmk_t *     ctx,
   }
   ctx->metrics.bytes_written    += comp_wr_;
   ctx->metrics.io_blocked_ticks += (ulong)( t1-t0 );
+  ctx->pool_sz[ ctx->snap_idx ] += comp_wr_;
   ctx->comp_buf.pos  = 0UL;
   ctx->comp_buf.size = COMP_BUF_SZ;
 }
@@ -611,6 +614,7 @@ zip_align( fd_snapmk_t * ctx ) {
     long t1 = fd_tickcount();
     ctx->metrics.bytes_written    += pad_sz;
     ctx->metrics.io_blocked_ticks += (ulong)( t1-t0 );
+    ctx->pool_sz[ ctx->snap_idx ] += pad_sz;
   }
   atomic_store_explicit( ctx->file_off_p, aoff, memory_order_release );
 }
@@ -686,7 +690,8 @@ snapmk_done_rename( fd_snapmk_t * ctx ) {
   if( FD_UNLIKELY( file_sz<0L ) ) {
     FD_LOG_ERR(( "lseek failed: %s", fd_io_strerror( errno ) ));
   }
-  ctx->final_sz = (ulong)file_sz;
+  ctx->final_sz                 = (ulong)file_sz;
+  ctx->pool_sz[ ctx->snap_idx ] = ctx->final_sz;
 
   fd_backup_inode_t * inode = &ctx->pool[ ctx->snap_idx ];
   struct flock lock = {
@@ -1329,14 +1334,17 @@ after_credit( fd_snapmk_t *       ctx,
     break;
   }
   case SNAPMK_STATE_ACCDB_DISK_FINISH:
-  case SNAPMK_STATE_ACCDB_DELTA_FINISH:
+  case SNAPMK_STATE_ACCDB_DELTA_FINISH: {
     /* accounts done, snapzp workers idle; now process status cache */
-    if( FD_UNLIKELY( lseek( ctx->snap_fd, 0L, SEEK_END )<0L ) ) {
+    long file_sz = lseek( ctx->snap_fd, 0L, SEEK_END );
+    if( FD_UNLIKELY( file_sz<0L ) ) {
       FD_LOG_ERR(( "lseek failed: %i-%s", errno, fd_io_strerror( errno ) ));
     }
+    ctx->pool_sz[ ctx->snap_idx ] = (ulong)file_sz;
     snapmk_status_cache_prepare( ctx );
     ctx->state = SNAPMK_STATE_STATUS_CACHE;
     break;
+  }
   case SNAPMK_STATE_STATUS_CACHE:
     /* process status cache piece wise */
     *charge_busy = 1;
@@ -1397,6 +1405,9 @@ after_credit( fd_snapmk_t *       ctx,
     }
     ulong snap_idx = ctx->startup_pool_idx++;
     fd_backup_inode_t * inode = &ctx->pool[ snap_idx ];
+    struct stat st;
+    if( FD_UNLIKELY( 0!=fstat( FD_SNAP_FD( snap_idx ), &st ) ) ) break;
+    ctx->pool_sz[ snap_idx ] = (ulong)st.st_size;
     if( FD_UNLIKELY( inode->full_slot==ULONG_MAX ) ) break;
     fd_snapmk_msg_found_t * msg = &snapmk_msg_alloc( ctx )->found;
     *msg = (fd_snapmk_msg_found_t) {
@@ -1406,8 +1417,6 @@ after_credit( fd_snapmk_t *       ctx,
       .fs_timestamp = LONG_MAX
     };
     fd_cstr_ncpy( msg->name, inode->name, sizeof(msg->name) );
-    struct stat st;
-    if( FD_UNLIKELY( 0!=fstat( FD_SNAP_FD( snap_idx ), &st ) ) ) break;
     msg->sz           = (ulong)st.st_size;
     msg->fs_timestamp = ((long)st.st_mtim.tv_sec*(long)1e9) + (long)st.st_mtim.tv_nsec;
     snapmk_msg_publish( ctx, stem, FD_SNAPMK_MSG_FOUND );
@@ -1488,6 +1497,7 @@ snap_pool_acquire( fd_snapmk_t *       ctx,
   if( FD_UNLIKELY( ftruncate( snap_fd, 0L ) ) ) {
     FD_LOG_ERR(( "ftruncate(%s) failed: %s", inode->name, fd_io_strerror( errno ) ));
   }
+  ctx->pool_sz[ snap_pool_idx ] = 0UL;
 
   char partial_name[ sizeof(inode->name) ];
   fd_snap_pool_partial_name( partial_name, snap_pool_idx );
@@ -1590,6 +1600,7 @@ snap_start( fd_snapmk_t *                  ctx,
   if( FD_UNLIKELY( ftruncate( ctx->snap_fd, 0L ) ) ) {
     FD_LOG_ERR(( "ftruncate(%s) failed: %i-%s", ctx->pool[ ctx->snap_idx ].name, errno, fd_io_strerror( errno ) ));
   }
+  ctx->pool_sz[ ctx->snap_idx ] = 0UL;
   if( FD_UNLIKELY( lseek( ctx->snap_fd, 0L, SEEK_SET )<0L ) ) {
     FD_LOG_ERR(( "lseek(%s) failed: %i-%s", ctx->pool[ ctx->snap_idx ].name, errno, fd_io_strerror( errno ) ));
   }
@@ -1929,6 +1940,13 @@ returnable_frag( fd_snapmk_t *       ctx,
 
 static void
 metrics_write( fd_snapmk_t * ctx ) {
+  ulong disk_alloc_bytes = 0UL;
+  for( uint i=0U; i<ctx->snap_max; i++ ) disk_alloc_bytes += ctx->pool_sz[ i ];
+  if( FD_LIKELY( ctx->snap_idx<ctx->snap_max ) ) {
+    ulong file_off = atomic_load_explicit( ctx->file_off_p, memory_order_relaxed );
+    disk_alloc_bytes += fd_ulong_sat_sub( file_off, ctx->pool_sz[ ctx->snap_idx ] );
+  }
+
   FD_MCNT_SET  ( SNAPMK, SNAPSHOTS_CREATED_FULL,                  ctx->metrics.snapshots_created_full                  );
   FD_MCNT_SET  ( SNAPMK, SNAPSHOTS_CREATED_INCREMENTAL,           ctx->metrics.snapshots_created_incremental           );
   FD_MGAUGE_SET( SNAPMK, LAST_SNAPSHOT_SLOT_STARTED_FULL,         ctx->metrics.last_snapshot_slot_started_full         );
@@ -1940,6 +1958,7 @@ metrics_write( fd_snapmk_t * ctx ) {
   FD_MCNT_SET  ( SNAPMK, BYTES_WRITTEN,               ctx->metrics.bytes_written    );
   FD_MCNT_SET  ( SNAPMK, IO_BLOCKED_DURATION_SECONDS, ctx->metrics.io_blocked_ticks );
   FD_MCNT_SET  ( SNAPMK, COMPRESS_DURATION_SECONDS,   ctx->metrics.compress_ticks   );
+  FD_MGAUGE_SET( SNAPMK, DISK_ALLOCATED_BYTES,        disk_alloc_bytes );
 
   FD_MGAUGE_SET( SNAPMK, INCREMENTAL_ACCOUNT_COUNT,    __atomic_load_n( &ctx->accdb_shmem->delta.head, __ATOMIC_RELAXED ) );
   FD_MGAUGE_SET( SNAPMK, INCREMENTAL_ACCOUNT_CAPACITY, ctx->accdb_shmem->delta.ele_max );

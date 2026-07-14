@@ -162,8 +162,8 @@ fd_gui_peers_printf_wfs_stakes( fd_gui_peers_ctx_t * peers );
 void
 fd_gui_printf_live_program_cache( fd_gui_t * gui );
 
-void
-fd_gui_printf_health( fd_gui_t * gui );
+void fd_gui_printf_health( fd_gui_t * gui );
+void fd_gui_printf_system_resources( fd_gui_t * gui );
 
 void
 fd_gui_printf_accounts_stats( fd_gui_t * gui );

@@ -701,11 +701,12 @@ cluster. If booting into an existing cluster, fetches cluster info (e.g.
 genesis hash).
 
 **`Tile`**
-| Field   | Type    | Description |
-|---------|---------|-------------|
-| kind    | `string` | What kind of tile it is. In Firedancer, one of the above tiles. In Frankendancer, might be one of `net`, `sock`, `quic`, `verify`, `dedup`, `pack`, `bank`, `poh`, `shred`, `store`, `sign`, `plugin`, or `http` |
-| kind_id | `number` | The index of the tile in its kind. For example, if there are four `verify` tiles they have `kind_id` values of 0, 1, 2, and 3 respectively |
-| pid     | `number` | The process id of the tile |
+| Field    | Type     | Description |
+|----------|----------|-------------|
+| kind     | `string` | What kind of tile it is. In Firedancer, one of the above tiles. In Frankendancer, might be one of `net`, `sock`, `quic`, `verify`, `dedup`, `pack`, `bank`, `poh`, `shred`, `store`, `sign`, `plugin`, or `http` |
+| kind_id  | `number` | The index of the tile in its kind. For example, if there are four `verify` tiles they have `kind_id` values of 0, 1, 2, and 3 respectively |
+| pid      | `number` | The process id of the tile |
+| priority | `string` | The priority label of the tile. One of `"floating"`, `"startup"`, `"normal"`, or `"critical"`. This is also reported in `summary.live_tile_metrics.priority` for backwards compatibility |
 
 ::: details Example
 
@@ -714,22 +715,14 @@ genesis hash).
     "topic": "summary",
     "key": "tiles",
     "value": [
-        { "tile": "net", "kind_id": 0 },
-        { "tile": "quic", "kind_id": 0 },
-        { "tile": "verify", "kind_id": 0 },
-        { "tile": "verify", "kind_id": 1 },
-        { "tile": "verify", "kind_id": 2 },
-        { "tile": "verify", "kind_id": 3 },
-        { "tile": "dedup", "kind_id": 0 },
-        { "tile": "pack", "kind_id": 0 },
-        { "tile": "bank", "kind_id": 0 },
-        { "tile": "bank", "kind_id": 1 },
-        { "tile": "poh", "kind_id": 0 },
-        { "tile": "shred", "kind_id": 0 },
-        { "tile": "store", "kind_id": 0 },
-        { "tile": "sign", "kind_id": 0 },
-        { "tile": "plugin", "kind_id": 0 }
-        { "tile": "http", "kind_id": 0 }
+        { "kind": "net",    "kind_id": 0, "pid": 1234, "priority": "critical" },
+        { "kind": "quic",   "kind_id": 0, "pid": 1235, "priority": "normal" },
+        { "kind": "verify", "kind_id": 0, "pid": 1236, "priority": "normal" },
+        { "kind": "verify", "kind_id": 1, "pid": 1237, "priority": "normal" },
+        { "kind": "dedup",  "kind_id": 0, "pid": 1238, "priority": "normal" },
+        { "kind": "pack",   "kind_id": 0, "pid": 1239, "priority": "normal" },
+        { "kind": "bank",   "kind_id": 0, "pid": 1240, "priority": "normal" },
+        { "kind": "poh",    "kind_id": 0, "pid": 1241, "priority": "critical" }
     ]
 }
 ```
@@ -1494,6 +1487,152 @@ are subsystem-specific and described below.
 | `stalled`          | The turbine slot has not advanced in over 12 seconds |
 | `repair_outpacing` | Turbine slot is advancing, but repair byte throughput has exceeded turbine byte throughput over the last 12-second window, indicating degraded turbine connectivity |
 | `running`          | Turbine is receiving shreds and its throughput exceeds repair |
+
+#### `summary.live_system_resources`
+| frequency      | type         | example |
+|----------------|--------------|---------|
+| *Once* + *30s* | `SystemLive` | below   |
+
+CPU topology and live host memory and disk usage. This message is only
+emitted by full Firedancer; Frankendancer omits it. CPU topology is
+captured at startup, while memory and disk values are sampled live.
+
+Memory values are best-effort snapshots refreshed every 30 seconds.
+
+::: details Example
+
+```json
+{
+    "topic": "summary",
+    "key": "live_system_resources",
+    "value": {
+        "cpus": [
+            { "online": true, "numa_node": 0, "sibling_cpu": 2, "tile_idxs": [0, 3] },
+            { "online": true, "numa_node": 0, "sibling_cpu": null, "tile_idxs": [1] },
+            { "online": true, "numa_node": 0, "sibling_cpu": 0, "tile_idxs": [] }
+        ],
+        "memory": {
+            "available_bytes": 326417514496,
+            "free_bytes": 214748364800,
+            "nodes": [
+                {
+                    "node": 0,
+                    "total_bytes": 274877906944,
+                    "free_bytes": 60129542144,
+                    "shared_bytes": 4294967296,
+                    "tiles": [
+                        { "tile_idx": 0, "bytes": 2147483648 },
+                        { "tile_idx": 1, "bytes": 8589934592 }
+                    ]
+                },
+                {
+                    "node": 1,
+                    "total_bytes": 274877906944,
+                    "free_bytes": 154618822656,
+                    "shared_bytes": 2147483648,
+                    "tiles": [
+                        { "tile_idx": 2, "bytes": 107374182400 }
+                    ]
+                }
+            ]
+        },
+        "disk": [
+            {
+                "name": "/data",
+                "total_bytes": 549755813888,
+                "used_bytes": 343597383680,
+                "firedancer": [
+                    { "category": "accounts", "bytes": 171798691840 },
+                    { "category": "shreds",   "bytes": 64424509440 },
+                    { "category": "gui",      "bytes": 1073741824 },
+                    { "category": "logs",     "bytes": 2147483648 }
+                ]
+            },
+            {
+                "name": "/mnt",
+                "total_bytes": 1099511627776,
+                "used_bytes": 665719930880,
+                "firedancer": [
+                    { "category": "snapshots", "bytes": 665719930880 }
+                ]
+            }
+        ]
+    }
+}
+```
+
+:::
+
+**`SystemLive`**
+| Field             | Type                     | Description |
+|-------------------|--------------------------|-------------|
+| cpus              | `SystemCpu[]`            | One entry per logical CPU. The array index is the logical CPU ID |
+| memory            | `SystemLiveMemory`       | Live host-wide and per-NUMA-node memory usage |
+| disk              | `SystemDiskMount[]`      | Live usage for filesystems used by the validator |
+
+**`SystemCpu`**
+| Field       | Type             | Description |
+|-------------|------------------|-------------|
+| online      | `boolean`        | Whether the CPU was online at validator startup |
+| numa_node   | `number`         | NUMA node containing this CPU |
+| sibling_cpu | `number \| null` | Logical CPU ID of the other hyperthread on the same physical core, or `null` when there is no known sibling. This ID indexes the `cpus` array |
+| tile_idxs   | `number[]`       | Indices in `summary.tiles` of tiles configured to run on this CPU. Multiple entries indicate configured CPU sharing, for example between startup and post-start tiles |
+
+**`SystemLiveMemory`**
+| Field           | Type                     | Description |
+|-----------------|--------------------------|-------------|
+| available_bytes | `number`                 | Host-wide estimate of physical RAM available for new allocations without swapping |
+| free_bytes      | `number`                 | Host-wide physical RAM currently unused |
+| nodes           | `SystemLiveMemoryNode[]` | Live memory usage by NUMA node |
+
+`available_bytes - free_bytes` provides a global estimate of memory that
+is currently in use but can be reclaimed without swapping, such as page
+cache and reclaimable kernel allocations.
+
+**`SystemLiveMemoryNode`**
+| Field        | Type                     | Description |
+|--------------|--------------------------|-------------|
+| node         | `number`                 | NUMA node index |
+| total_bytes  | `number`                 | Total physical RAM local to this node |
+| free_bytes   | `number`                 | Physical RAM reported free on this node |
+| shared_bytes | `number`                 | Resident validator memory shared by tiles or not attributable to one tile |
+| tiles        | `SystemLiveMemoryTile[]` | Resident validator memory uniquely attributable to individual tiles |
+
+**`SystemLiveMemoryTile`**
+| Field    | Type     | Description |
+|----------|----------|-------------|
+| tile_idx | `number` | Index of the tile in the `summary.tiles` message array |
+| bytes    | `number` | Resident user-space physical memory uniquely attributable to this tile |
+
+The exact resident validator total represented on a NUMA node is:
+
+```text
+shared_bytes + Σ tiles.bytes
+```
+
+This total counts resident user-space physical memory only. It excludes
+kernel memory and ordinary file-backed mappings such as databases and
+executables. Firedancer hugetlbfs workspaces and tile stacks are included.
+A workspace with one owning tile is attributed to that tile; a workspace
+with multiple owners or no unique owner is reported in `shared_bytes`.
+With `development.no_clone = true`, anonymous memory that cannot be
+attributed to an individual tile is also reported in `shared_bytes`.
+
+**`SystemDiskMount`**
+A mount is included if at least one validator data path resolves onto it.
+
+| Field       | Type                | Description |
+|-------------|---------------------|-------------|
+| name        | `string`            | Filesystem mount point, e.g. `/data` or `/mnt` |
+| total_bytes | `number`            | Total filesystem capacity in bytes |
+| used_bytes  | `number`            | Total bytes used on the filesystem, including files not written by the validator |
+| firedancer  | `SystemDiskUsage[]` | Validator disk usage by category |
+
+**`SystemDiskUsage`**
+| Field    | Type     | Description |
+|----------|----------|-------------|
+| category | `string` | One of `accounts`, `shreds`, `snapshots`, `gui`, or `logs`. Clients should tolerate unknown values |
+| bytes    | `number` | Logical length owned and maintained by this category. The value may lag filesystem changes but converges to the current logical length |
 
 ### accounts
 Live view of the accounts database backend. The accounts database is a

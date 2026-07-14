@@ -11,12 +11,47 @@
 #include <limits.h>
 #include <pthread.h>
 #include <sys/syscall.h>
+#include <linux/capability.h>
 #include <linux/futex.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <net/if.h>
+
+static void
+raise_cap_sys_ptrace( void ) {
+  struct __user_cap_header_struct capheader = {
+    .version = _LINUX_CAPABILITY_VERSION_3,
+    .pid     = 0
+  };
+  struct __user_cap_data_struct capdata[ 2 ] = { {0} };
+  if( FD_UNLIKELY( syscall( SYS_capget, &capheader, capdata ) ) ) FD_LOG_ERR(( "capget failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+  fd_msan_unpoison( capdata, sizeof(capdata) );
+  uint mask = (uint)CAP_TO_MASK( CAP_SYS_PTRACE );
+  if( FD_UNLIKELY( !(capdata[ CAP_TO_INDEX( CAP_SYS_PTRACE ) ].permitted & mask) ) )
+    FD_LOG_ERR(( "diag requires CAP_SYS_PTRACE during privileged initialization" ));
+  capdata[ CAP_TO_INDEX( CAP_SYS_PTRACE ) ].effective |= mask;
+  if( FD_UNLIKELY( syscall( SYS_capset, &capheader, capdata ) ) ) FD_LOG_ERR(( "capset failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+}
+
+static void
+drop_cap_sys_ptrace( void ) {
+  struct __user_cap_header_struct capheader = {
+    .version = _LINUX_CAPABILITY_VERSION_3,
+    .pid     = 0
+  };
+  struct __user_cap_data_struct capdata[ 2 ] = { {0} };
+  if( FD_UNLIKELY( syscall( SYS_capget, &capheader, capdata ) ) ) FD_LOG_ERR(( "capget failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+  fd_msan_unpoison( capdata, sizeof(capdata) );
+  uint mask = (uint)CAP_TO_MASK( CAP_SYS_PTRACE );
+  capdata[ CAP_TO_INDEX( CAP_SYS_PTRACE ) ].effective   &= ~mask;
+  capdata[ CAP_TO_INDEX( CAP_SYS_PTRACE ) ].permitted   &= ~mask;
+  capdata[ CAP_TO_INDEX( CAP_SYS_PTRACE ) ].inheritable &= ~mask;
+  if( FD_UNLIKELY( syscall( SYS_capset, &capheader, capdata ) ) ) FD_LOG_ERR(( "capset failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+  if( FD_UNLIKELY( prctl( PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER, CAP_SYS_PTRACE, 0, 0 ) && errno!=EINVAL ) )
+    FD_LOG_ERR(( "prctl(PR_CAP_AMBIENT_LOWER,CAP_SYS_PTRACE) failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+}
 
 static void
 initialize_logging( char const * tile_name,
@@ -69,11 +104,15 @@ fd_topo_run_tile( fd_topo_t *          topo,
   /* preload shared memory before sandboxing, so it is already mapped */
   fd_topo_join_tile_workspaces( topo, tile, core_dump_level );
 
+  int diag_ptrace = !strcmp( tile->name, "diag" ) && tile->diag.gui_enabled;
+  if( FD_UNLIKELY( diag_ptrace ) ) raise_cap_sys_ptrace();
   if( FD_UNLIKELY( tile_run->privileged_init ) )
     tile_run->privileged_init( topo, tile );
+  if( FD_UNLIKELY( diag_ptrace ) ) drop_cap_sys_ptrace();
 
   ulong allow_fds_offset = 0UL;
-  int allow_fds[ 256 ] = { 0 };
+  /* Covers diag's retained descriptors at FD_TOPO_MAX_TILES (256). */
+  int allow_fds[ 1024 ] = { 0 };
   if( FD_LIKELY( -1!=allow_fd ) ) {
     allow_fds_offset = 1UL;
     allow_fds[ 0 ] = allow_fd;

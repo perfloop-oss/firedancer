@@ -185,7 +185,7 @@ snapshot_load_topo( config_t * config ) {
 
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
     fd_topo_tile_t * tile = &topo->tiles[ i ];
-    fd_topo_configure_tile( tile, config );
+    fd_topo_configure_tile( topo, tile, config );
   }
 
   fd_topob_auto_layout( topo, 0 );

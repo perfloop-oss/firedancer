@@ -550,6 +550,8 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->metric.prometheus_listen_port = config->tiles.metric.prometheus_listen_port;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "diag" ) ) ) {
+    tile->diag.no_clone    = config->development.no_clone;
+    tile->diag.gui_enabled = 0;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "guih" ) ) ) {
     if( FD_UNLIKELY( !fd_cstr_to_ip4_addr( config->tiles.gui.gui_listen_address, &tile->gui.listen_addr ) ) )
