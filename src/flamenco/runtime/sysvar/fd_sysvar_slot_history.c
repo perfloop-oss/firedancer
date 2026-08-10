@@ -1,5 +1,6 @@
 #include "fd_sysvar_slot_history.h"
 #include "fd_sysvar.h"
+#include "fd_sysvar_rent.h"
 #include "../fd_system_ids.h"
 #include "../fd_accdb_svm.h"
 
@@ -49,6 +50,15 @@ fd_sysvar_slot_history_update( fd_bank_t *        bank,
   fd_acc_t acc = fd_accdb_svm_open_rw( bank, accdb, update, &fd_sysvar_slot_history_id, 0 );
   FD_TEST( acc.lamports ); /* Slot history account must exist */
   FD_TEST( !memcmp( acc.owner, fd_sysvar_owner_id.uc, sizeof(fd_pubkey_t) ) ); /* Slot history account must be owned by sysvar owner */
+
+  /* Ensure account is rent exempt.  Agave's update_sysvar_account() runs
+     adjust_sysvar_balance_for_rent() on every sysvar update, which raises
+     the balance to the rent exempt minimum (and grows capitalization by
+     the difference).  Applied before the early return paths below so that
+     every exit from this function matches Agave.
+     https://github.com/anza-xyz/agave/blob/v4.2.0-rc.1/runtime/src/bank.rs#L6284-L6289 */
+  ulong rent_min = fd_rent_exempt_minimum_balance( &bank->f.rent, acc.data_len );
+  if( FD_UNLIKELY( rent_min>acc.lamports ) ) acc.lamports = rent_min;
 
   if( FD_UNLIKELY( acc.data[ 0 ]!=1 ) ) {
     /* initialize if !has_bits */

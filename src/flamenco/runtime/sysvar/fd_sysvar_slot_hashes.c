@@ -1,5 +1,6 @@
 #include "fd_sysvar_slot_hashes.h"
 #include "fd_sysvar.h"
+#include "fd_sysvar_rent.h"
 #include "../fd_system_ids.h"
 #include "../fd_accdb_svm.h"
 
@@ -28,6 +29,15 @@ fd_sysvar_slot_hashes_update( fd_bank_t *        bank,
   if( FD_UNLIKELY( 0!=memcmp( acc.owner, &fd_sysvar_owner_id, sizeof(fd_pubkey_t) ) ) ) {
     FD_LOG_ERR(( "slot hashes sysvar not owned by sysvar owner" ));
   }
+
+  /* Ensure account is rent exempt.  Agave's update_sysvar_account() runs
+     adjust_sysvar_balance_for_rent() on every sysvar update, which raises
+     the balance to the rent exempt minimum (and grows capitalization by
+     the difference).
+     https://github.com/anza-xyz/agave/blob/v4.2.0-rc.1/runtime/src/bank.rs#L6284-L6289 */
+  ulong rent_min = fd_rent_exempt_minimum_balance( &bank->f.rent, acc.data_len );
+  if( FD_UNLIKELY( rent_min>acc.lamports ) ) acc.lamports = rent_min;
+
   uchar * data    = acc.data;
   ulong   data_sz = acc.data_len;
   if( FD_UNLIKELY( data_sz < FD_SYSVAR_SLOT_HASHES_BINCODE_SZ ) ) {
