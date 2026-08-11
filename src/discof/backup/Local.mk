@@ -11,6 +11,8 @@ $(call run-unit-test,test_snap_roundtrip)
 ifdef FD_HAS_ATOMIC
 $(call make-unit-test,test_backup_disk,test_backup_disk,fd_discof fd_flamenco fd_funk fd_tango fd_ballet fd_util fd_disco)
 $(call run-unit-test,test_backup_disk)
+$(call make-unit-test,test_snapsv,test_snapsv,fd_discof fd_flamenco fd_funk fd_tango fd_ballet fd_util fd_disco)
+$(call run-unit-test,test_snapsv)
 endif
 endif
 endif
