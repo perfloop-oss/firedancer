@@ -1186,7 +1186,6 @@ serve_redirect( fd_snapsv_t * ctx,
       snap->hash,
       snap->is_zstd,
       conn->sick );
-  conn->state = CONN_STATE_RES_WRITE_HDR; /* shared completion path */
   prep_write_hdr( ctx, conn_idx );
 }
 
@@ -1223,7 +1222,8 @@ handle_write_hdr_comp( fd_snapsv_t * ctx,
   }
   switch( conn->state ) {
   case CONN_STATE_RES_WRITE_ERR:
-    /* returned an error, handle the next request */
+  case CONN_STATE_RES_REDIRECT:
+    /* returned header-only response, handle the next request */
     conn->state = CONN_STATE_REQ_PEEK;
     prep_peek( ctx, conn_idx );
     return;
@@ -1399,6 +1399,12 @@ handle_peek( fd_snapsv_t * ctx,
     conn->sick     = 1;
     return;
   }
+
+  conn->range       = 0U;
+  conn->snap.key    = (snap_key_t){ ULONG_MAX, ULONG_MAX };
+  conn->snap.slot   = NULL;
+  conn->snap.range0 = 0UL;
+  conn->snap.range1 = 0UL;
 
   /* strip leading slashes */
   if( FD_UNLIKELY( path_len<10    ) ) goto not_found;
