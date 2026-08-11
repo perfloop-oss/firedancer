@@ -756,17 +756,36 @@ process_manifest( fd_snapin_tile_t *  ctx,
     return;
   }
 
-  if( FD_UNLIKELY( ctx->wfs_slot && memcmp( ctx->wfs_bank_hash.uc, ((fd_hash_t){0}).uc, FD_HASH_FOOTPRINT )
-                   && manifest->slot==ctx->wfs_slot ) ) {
-    if( FD_UNLIKELY( memcmp( manifest->bank_hash, ctx->wfs_bank_hash.uc, FD_HASH_FOOTPRINT ) ) ) {
-      FD_BASE58_ENCODE_32_BYTES( manifest->bank_hash,   manifest_hash_enc );
-      FD_BASE58_ENCODE_32_BYTES( ctx->wfs_bank_hash.uc, expected_hash_enc );
-      FD_LOG_WARNING(( "snapshot manifest bank hash %s at WFS slot %lu does not match "
-                       "configured wait_for_supermajority_with_bank_hash %s",
-                       manifest_hash_enc, ctx->wfs_slot, expected_hash_enc ));
-      transition_malformed( ctx, stem );
-      return;
+  if( FD_UNLIKELY( ctx->wfs_slot ) ) {
+    int wfs_hash_configured = memcmp( ctx->wfs_bank_hash.uc, ((fd_hash_t){0}).uc, FD_HASH_FOOTPRINT )!=0;
+    int slot_matches_wfs    = manifest->slot==ctx->wfs_slot;
+    FD_LOG_NOTICE(( "*** DEBUG ONLY *** snapin WFS check: wfs_slot=%lu manifest_slot=%lu slot_matches_wfs=%d "
+                    "wfs_hash_configured=%d full=%d",
+                    ctx->wfs_slot, manifest->slot, slot_matches_wfs, wfs_hash_configured, ctx->full ));
+    if( FD_UNLIKELY( wfs_hash_configured && slot_matches_wfs ) ) {
+      if( FD_UNLIKELY( memcmp( manifest->bank_hash, ctx->wfs_bank_hash.uc, FD_HASH_FOOTPRINT ) ) ) {
+        FD_BASE58_ENCODE_32_BYTES( manifest->bank_hash,   manifest_hash_enc );
+        FD_BASE58_ENCODE_32_BYTES( ctx->wfs_bank_hash.uc, expected_hash_enc );
+        FD_LOG_NOTICE(( "*** DEBUG ONLY *** snapin WFS bank hash MISMATCH: manifest=%s expected=%s",
+                        manifest_hash_enc, expected_hash_enc ));
+        FD_LOG_WARNING(( "snapshot manifest bank hash %s at WFS slot %lu does not match "
+                         "configured wait_for_supermajority_with_bank_hash %s",
+                         manifest_hash_enc, ctx->wfs_slot, expected_hash_enc ));
+        transition_malformed( ctx, stem );
+        return;
+      }
+      FD_BASE58_ENCODE_32_BYTES( manifest->bank_hash, manifest_hash_enc2 );
+      FD_LOG_NOTICE(( "*** DEBUG ONLY *** snapin WFS bank hash MATCH: manifest slot %lu hash %s matches configured WFS hash",
+                      manifest->slot, manifest_hash_enc2 ));
+    } else if( !slot_matches_wfs ) {
+      FD_LOG_NOTICE(( "*** DEBUG ONLY *** snapin WFS hash check skipped: manifest slot %lu != wfs slot %lu",
+                      manifest->slot, ctx->wfs_slot ));
+    } else {
+      FD_LOG_NOTICE(( "*** DEBUG ONLY *** snapin WFS hash check skipped: no WFS bank hash configured (all zeros)" ));
     }
+  } else {
+    FD_LOG_NOTICE(( "*** DEBUG ONLY *** snapin WFS check: WFS not active (wfs_slot=0), no WFS validation for manifest slot %lu",
+                    manifest->slot ));
   }
 
   if( FD_UNLIKELY( verify_slot_deltas_with_bank_slot( ctx, manifest->slot ) ) ) {
@@ -1610,6 +1629,11 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->wfs_slot      = tile->snapin.wait_for_supermajority_at_slot;
   ctx->wfs_bank_hash = tile->snapin.wait_for_supermajority_with_bank_hash;
+  {
+    int wfs_hash_nonzero = memcmp( ctx->wfs_bank_hash.uc, ((fd_hash_t){0}).uc, FD_HASH_FOOTPRINT )!=0;
+    FD_LOG_NOTICE(( "*** DEBUG ONLY *** snapin init: wfs_slot=%lu wfs_bank_hash_configured=%d",
+                    ctx->wfs_slot, wfs_hash_nonzero ));
+  }
 
   fd_memset( &ctx->flags, 0, sizeof(ctx->flags) );
   ctx->boot_timestamp = fd_log_wallclock();
