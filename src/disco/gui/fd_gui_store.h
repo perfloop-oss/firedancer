@@ -356,6 +356,17 @@ fd_gui_store_ts_oldest_window( fd_gui_store_t * db,
                                ulong            ring_idx,
                                ulong *          out_window );
 
+/* fd_gui_store_ts_live_window_bounds returns the windows of the first and
+   last live records in the append ring.  These are append-order endpoints,
+   not necessarily the minimum and maximum windows when timestamps arrive
+   slightly out of order.  Returns 1 when the ring is non-empty, 0 otherwise. */
+
+int
+fd_gui_store_ts_live_window_bounds( fd_gui_store_t * db,
+                                    ulong            ring_idx,
+                                    ulong *          out_first_window,
+                                    ulong *          out_last_window );
+
 /* ---- TS ring: eviction ---------------------------------------------- */
 
 /* fd_gui_store_ts_evict reclaims drained records (up to budget records)

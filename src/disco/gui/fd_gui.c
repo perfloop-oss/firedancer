@@ -108,6 +108,7 @@ fd_gui_new( void *                   shmem,
             char const *             accounts_database_path,
             char const *             gui_database_path,
             void *                   db,
+            fd_alloc_t *             alloc,
             fd_topo_t const *        topo,
             fd_accdb_shmem_t const * accdb_shmem,
             long                     now ) {
@@ -136,6 +137,7 @@ fd_gui_new( void *                   shmem,
   void *     hist_mem         = FD_SCRATCH_ALLOC_APPEND( l, fd_gui_hist_align(),       fd_gui_hist_footprint() );
 
   gui->http        = http;
+  gui->alloc       = alloc;
   gui->topo        = topo;
   gui->accdb_shmem = accdb_shmem;
   gui->tick_per_ns = fd_tempo_tick_per_ns( NULL );
@@ -2022,19 +2024,50 @@ fd_gui_request_slot_rankings( fd_gui_t *    gui,
 
 static inline int
 fd_gui_cjson_parse_ns( cJSON const * param,
-                          long *        out ) {
-  if( FD_UNLIKELY( !param ) ) return -1;
-  if( cJSON_IsNumber( param ) ) {
-    double v = param->valuedouble;
-    if( FD_UNLIKELY( !(v>=0.0 && v<(double)LONG_MAX) ) ) return -1;
-    *out = (long)v;
-    return 0;
+                       long *        out ) {
+  if( FD_UNLIKELY( !cJSON_IsString( param ) || !param->valuestring || !param->valuestring[ 0 ] ) ) return -1;
+
+  ulong value = 0UL;
+  for( char const * p=param->valuestring; *p; p++ ) {
+    if( FD_UNLIKELY( *p<'0' || *p>'9' ) ) return -1;
+    ulong digit = (ulong)(*p-'0');
+    if( FD_UNLIKELY( value>((ulong)LONG_MAX-1UL-digit)/10UL ) ) return -1;
+    value = 10UL*value + digit;
   }
-  if( cJSON_IsString( param ) && param->valuestring ) {
-    *out = fd_cstr_to_long( param->valuestring );
-    return 0;
+  *out = (long)value;
+  return 0;
+}
+
+/* cJSON stores decoded strings as NUL-terminated C strings without their
+   decoded length.  Reject literal NUL bytes and escaped U+0000 before parsing
+   so a value such as "1\u0000junk" cannot be observed below as "1". */
+
+static inline int
+fd_gui_json_has_nul( uchar const * data,
+                     ulong         data_len ) {
+  int in_string = 0;
+  for( ulong i=0UL; i<data_len; i++ ) {
+    uchar c = data[ i ];
+    if( FD_UNLIKELY( !c ) ) return 1;
+    if( c=='"' ) {
+      in_string = !in_string;
+      continue;
+    }
+    if( FD_LIKELY( !in_string || c!='\\' ) ) continue;
+    if( FD_UNLIKELY( i+5UL<data_len && data[ i+1UL ]=='u' &&
+                     data[ i+2UL ]=='0' && data[ i+3UL ]=='0' &&
+                     data[ i+4UL ]=='0' && data[ i+5UL ]=='0' ) ) return 1;
+    if( FD_LIKELY( i+1UL<data_len ) ) i++;
   }
-  return -1;
+  return 0;
+}
+
+static inline int
+fd_gui_timeline_ws_send( fd_gui_t * gui,
+                         ulong      ws_conn_id ) {
+  return fd_http_server_ws_send( gui->http, ws_conn_id )
+       ? FD_HTTP_SERVER_CONNECTION_CLOSE_EVICTED
+       : 0;
 }
 
 static int
@@ -2049,13 +2082,31 @@ fd_gui_request_timeline_shreds( fd_gui_t *    gui,
   long start_ns, end_ns;
   if( FD_UNLIKELY( fd_gui_cjson_parse_ns( start_param, &start_ns ) ) ) return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
   if( FD_UNLIKELY( fd_gui_cjson_parse_ns( end_param,   &end_ns   ) ) ) return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
-  if( FD_UNLIKELY( !(start_ns>=0L && start_ns<LONG_MAX) || !(end_ns>=0L && end_ns<LONG_MAX) ) ) return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
   if( FD_UNLIKELY( end_ns<start_ns ) ) return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
-  if( FD_UNLIKELY( end_ns-start_ns>60L*1000L*1000L*1000L ) ) return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST; /* TODO: tune/remove */
 
-  fd_gui_printf_timeline_query_shreds( gui, topic, start_ns, end_ns, request_id );
-  FD_TEST( !fd_http_server_ws_send( gui->http, ws_conn_id ) );
-  return 0;
+  if( FD_UNLIKELY( fd_gui_printf_timeline_query_shreds( gui, topic, start_ns, end_ns, request_id ) ) )
+    return FD_HTTP_SERVER_CONNECTION_CLOSE_EVICTED;
+  return fd_gui_timeline_ws_send( gui, ws_conn_id );
+}
+
+static int
+fd_gui_request_timeline_txns( fd_gui_t *    gui,
+                              ulong         ws_conn_id,
+                              char const *  topic,
+                              char const *  key,
+                              ulong         request_id,
+                              cJSON const * params ) {
+  const cJSON * start_param = cJSON_GetObjectItemCaseSensitive( params, "start_ns" );
+  const cJSON * end_param   = cJSON_GetObjectItemCaseSensitive( params, "end_ns"   );
+
+  long start_ns, end_ns;
+  if( FD_UNLIKELY( fd_gui_cjson_parse_ns( start_param, &start_ns ) ) ) return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
+  if( FD_UNLIKELY( fd_gui_cjson_parse_ns( end_param,   &end_ns   ) ) ) return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
+  if( FD_UNLIKELY( end_ns<start_ns ) ) return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
+
+  if( FD_UNLIKELY( fd_gui_printf_timeline_query_txns( gui, topic, key, start_ns, end_ns, request_id ) ) )
+    return FD_HTTP_SERVER_CONNECTION_CLOSE_EVICTED;
+  return fd_gui_timeline_ws_send( gui, ws_conn_id );
 }
 
 static int
@@ -2117,6 +2168,9 @@ fd_gui_ws_message( fd_gui_t *    gui,
                    ulong         ws_conn_id,
                    uchar const * data,
                    ulong         data_len ) {
+  if( FD_UNLIKELY( fd_gui_json_has_nul( data, data_len ) ) )
+    return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
+
   /* TODO: cJSON allocates, might fail SIGSYS due to brk(2)...
      switch off this (or use wksp allocator) */
   const char * parse_end;
@@ -2195,7 +2249,8 @@ fd_gui_ws_message( fd_gui_t *    gui,
     cJSON_Delete( json );
     return result;
   } else if( FD_LIKELY( !strcmp( topic->valuestring, "timeline" ) &&
-                        ( !strcmp( key->valuestring, "query_agg_shreds" ) ||
+                        ( !strcmp( key->valuestring, "query_agg_slots" ) ||
+                          !strcmp( key->valuestring, "query_agg_shreds" ) ||
                           !strcmp( key->valuestring, "query_agg_compute" ) ||
                           !strcmp( key->valuestring, "query_agg_revenue" ) ) ) ) {
     cJSON const * params = cJSON_GetObjectItemCaseSensitive( json, "params" );
@@ -2203,7 +2258,20 @@ fd_gui_ws_message( fd_gui_t *    gui,
       cJSON_Delete( json );
       return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
     }
+
     int result = fd_gui_request_timeline_agg( gui, ws_conn_id, key->valuestring, id, params );
+    cJSON_Delete( json );
+    return result;
+  } else if( FD_LIKELY( !strcmp( topic->valuestring, "timeline" ) &&
+                        ( !strcmp( key->valuestring, "query_txn_timestamps" ) ||
+                          !strcmp( key->valuestring, "query_txn_meta"       ) ) ) ) {
+    const cJSON * params = cJSON_GetObjectItemCaseSensitive( json, "params" );
+    if( FD_UNLIKELY( !cJSON_IsObject( params ) ) ) {
+      cJSON_Delete( json );
+      return FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST;
+    }
+
+    int result = fd_gui_request_timeline_txns( gui, ws_conn_id, topic->valuestring, key->valuestring, id, params );
     cJSON_Delete( json );
     return result;
   } else if( FD_LIKELY( !strcmp( topic->valuestring, "summary" ) && !strcmp( key->valuestring, "ping" ) ) ) {
@@ -2731,7 +2799,12 @@ fd_gui_timeline_root_delta( fd_gui_t *      gui,
 void
 fd_gui_timeline_root_slot( fd_gui_t *            gui,
                            fd_gui_slot_t const * slot ) {
-  if( FD_UNLIKELY( !slot || slot->skip==FD_GUI_SKIP_STATUS_SKIPPED || slot->completed_time==LONG_MAX || slot->completed_time<0L ) ) return;
+  if( FD_UNLIKELY( !slot || slot->slot==ULONG_MAX || slot->skip==FD_GUI_SKIP_STATUS_SKIPPED || slot->completed_time==LONG_MAX || slot->completed_time<0L ) ) return;
+
+  /* parent_slot is the preceding landed slot on this rooted fork.  Assign
+     any skipped numeric gap to this slot's completion bucket. */
+  ulong start_slot = slot->slot;
+  if( FD_LIKELY( slot->parent_slot!=ULONG_MAX && slot->parent_slot<slot->slot ) ) start_slot = slot->parent_slot+1UL;
 
   ulong ts_ns   = (ulong)slot->completed_time;
   ulong day_idx = ts_ns/(ulong)FD_GUI_TIMELINE_DAY_NS;
@@ -2749,6 +2822,12 @@ fd_gui_timeline_root_slot( fd_gui_t *            gui,
 
   for( ulong g=0UL; g<FD_GUI_TIMELINE_GRANULARITY_CNT; g++ ) {
     ulong idx = fd_gui_timeline_granularity_off[ g ] + day_ns/fd_gui_timeline_granularity_ns[ g ];
+    day->start_slot[ idx ] = day->start_slot[ idx ]==ULONG_MAX
+                           ? start_slot
+                           : fd_ulong_min( day->start_slot[ idx ], start_slot );
+    day->end_slot  [ idx ] = day->end_slot[ idx ]==ULONG_MAX
+                           ? slot->slot
+                           : fd_ulong_max( day->end_slot[ idx ], slot->slot );
     TIMELINE_ADD( shreds,        slot->block_shred_cnt,              UINT_MAX  );
     TIMELINE_ADD( turbine,       slot->turbine_shred_cnt,            UINT_MAX  );
     TIMELINE_ADD( repair,        slot->repair_shred_cnt,             UINT_MAX  );
@@ -3245,6 +3324,58 @@ fd_gui_stage_landed_vote( fd_gui_t * gui,
   gui->landed_votes[ gui->landed_vote_cnt ].landed_bank_seq = landed_bank_seq;
   gui->landed_votes[ gui->landed_vote_cnt ].voted_slot      = voted_slot;
   gui->landed_vote_cnt++;
+}
+
+static inline long
+fd_gui_replay_tick_to_nanos( fd_gui_t const * gui,
+                             long             now,
+                             long             tick_now,
+                             long             tick ) {
+  if( FD_UNLIKELY( tick==LONG_MAX ) ) return LONG_MAX;
+  return now + (long)((double)(tick-tick_now) / gui->tick_per_ns);
+}
+
+void
+fd_gui_handle_replay_txn( fd_gui_t *                         gui,
+                          fd_replay_txn_executed_t const * txn,
+                          long                               now ) {
+  if( FD_UNLIKELY( txn->tick_sigverify_done==LONG_MAX || txn->tick_commit_end==LONG_MAX ) ) return;
+
+  long tick_now        = fd_tickcount();
+  long completion_tick = fd_long_max( txn->tick_sigverify_done, txn->tick_commit_end );
+
+  uint  pack_flags             = 0U;
+  ulong compute_units_requested = fd_pack_compute_cost( TXN( txn->txn ), txn->txn->payload,
+                                                        &pack_flags, NULL, NULL, NULL, NULL, NULL );
+
+  fd_gui_store_replay_txn_t rec = {
+    .completion_time_ns      = fd_gui_replay_tick_to_nanos( gui, now, tick_now, completion_tick ),
+    .slot                    = txn->slot,
+    .txn_idx                 = txn->index_in_slot,
+    .txn_exec_idx            = txn->exec_tile_idx,
+    .sigverify_start_ns      = fd_gui_replay_tick_to_nanos( gui, now, tick_now, txn->tick_sigverify_disp ),
+    .sigverify_end_ns        = fd_gui_replay_tick_to_nanos( gui, now, tick_now, txn->tick_sigverify_done ),
+    .exec_start_ns           = fd_gui_replay_tick_to_nanos( gui, now, tick_now, txn->tick_exec_disp ),
+    .load_start_ns           = fd_gui_replay_tick_to_nanos( gui, now, tick_now, txn->tick_load_start ),
+    .check_start_ns          = fd_gui_replay_tick_to_nanos( gui, now, tick_now, txn->tick_check_start ),
+    .execute_start_ns        = fd_gui_replay_tick_to_nanos( gui, now, tick_now, txn->tick_execute_start ),
+    .commit_start_ns         = fd_gui_replay_tick_to_nanos( gui, now, tick_now, txn->tick_commit_start ),
+    .commit_end_ns           = fd_gui_replay_tick_to_nanos( gui, now, tick_now, txn->tick_commit_end ),
+    .transaction_fee         = txn->transaction_fee,
+    .priority_fee            = txn->priority_fee,
+    .tips                    = txn->tips,
+    .compute_units_requested = (uint)compute_units_requested,
+    .compute_units_consumed  = txn->compute_units_consumed,
+    .error_code              = (uint)(-(long)txn->txn_err),
+    .is_committable          = (uchar)!!txn->runtime_is_committable,
+    .is_fees_only            = (uchar)!!txn->runtime_is_fees_only,
+    .is_simple_vote          = (uchar)!!txn->runtime_is_simple_vote
+  };
+  fd_memcpy( rec.signature,
+             txn->txn->payload + TXN( txn->txn )->signature_off,
+             FD_TXN_SIGNATURE_SZ );
+
+  fd_gui_hist_ts_append( gui, FD_GUI_HIST_REPLAY_TXN, now, rec.completion_time_ns, &rec );
 }
 
 void

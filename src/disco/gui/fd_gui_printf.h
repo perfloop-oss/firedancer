@@ -99,12 +99,25 @@ fd_gui_printf_slot_transactions_request( fd_gui_t *            gui,
                                          ulong                id,
                                          fd_gui_slot_t const * slot );
 
-void
+/* The timeline query printers first collect a bounded result without
+   staging output, then stage either the complete value or the result-limit
+   error.  They return 0 once a response is staged and -1 on internal
+   allocation/history failure. */
+
+int
 fd_gui_printf_timeline_query_shreds( fd_gui_t *   gui,
                                      char const * topic,
                                      long         start_ns,
                                      long         end_ns,
                                      ulong        id );
+
+int
+fd_gui_printf_timeline_query_txns( fd_gui_t *   gui,
+                                   char const * topic,
+                                   char const * key,
+                                   long         start_ns,
+                                   long         end_ns,
+                                   ulong        id );
 
 void
 fd_gui_printf_timeline_query_agg( fd_gui_t *   gui,

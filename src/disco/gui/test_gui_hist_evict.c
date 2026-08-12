@@ -143,6 +143,16 @@ append_shred( fd_gui_t * gui, long ts_ns, ulong slot ) {
   FD_TEST( !fd_gui_hist_ts_append( gui, FD_GUI_HIST_SHRED_EVENTS, ts_ns, ts_ns, rec ) );
 }
 
+static void
+append_replay_txn( fd_gui_t * gui, long ts_ns, ulong slot ) {
+  fd_gui_store_replay_txn_t rec[ 1 ];
+  memset( rec, 0, sizeof(*rec) );
+  rec->completion_time_ns = ts_ns;
+  rec->slot               = slot;
+
+  FD_TEST( !fd_gui_hist_ts_append( gui, FD_GUI_HIST_REPLAY_TXN, ts_ns, ts_ns, rec ) );
+}
+
 /* ---- read helpers (presence checks) ----------------------------------- */
 
 static int
@@ -214,19 +224,22 @@ test_http_expect( fd_http_server_t * http,
 }
 
 static void
-test_timeline_queries( fd_gui_t * gui ) {
+test_timeline_agg_queries( fd_gui_t * gui ) {
   void * http_mem = NULL;
   fd_http_server_t * http = test_http_new( &http_mem );
   gui->http = http;
   gui->summary.slot_rooted = 7000UL;
 
-  /* One slot on each side of midnight exercises the renderer's daily-record
-     cache and verifies that dense arrays preserve the common bucket index. */
+  /* One metric-bearing slot on each side of midnight exercises the renderer's
+     daily-record cache and verifies that dense arrays preserve the common
+     bucket index. */
   fd_gui_slot_t slots[ 2 ];
   memset( slots, 0xFF, sizeof(slots) );
+  ulong const slot_number[ 2 ] = { 6000UL, 6002UL };
   for( ulong i=0UL; i<2UL; i++ ) {
-    slots[ i ].slot                          = 6000UL+i;
+    slots[ i ].slot                          = slot_number[ i ];
     slots[ i ].bank_seq                      = 1UL;
+    slots[ i ].parent_slot                   = i ? slot_number[ i-1UL ] : slot_number[ i ]-1UL;
     slots[ i ].completed_time                = (long)((i+1UL)*FD_GUI_TIMELINE_DAY_NS)+(i ? 500000000L : FD_GUI_TIMELINE_DAY_NS-500000000L);
     slots[ i ].skip                          = FD_GUI_SKIP_STATUS_NOT_SKIPPED;
     slots[ i ].mine                          = 0;
@@ -244,17 +257,40 @@ test_timeline_queries( fd_gui_t * gui ) {
     fd_gui_timeline_root_slot( gui, &slots[ i ] );
   }
 
+  /* A second landed slot in the latter bucket extends that bucket's range
+     without contributing any additional metrics. */
+  fd_gui_slot_t same_bucket;
+  memset( &same_bucket, 0xFF, sizeof(same_bucket) );
+  same_bucket.slot           = 6003UL;
+  same_bucket.parent_slot    = slot_number[ 1 ];
+  same_bucket.completed_time = 2L*FD_GUI_TIMELINE_DAY_NS+750000000L;
+  same_bucket.skip           = FD_GUI_SKIP_STATUS_NOT_SKIPPED;
+  same_bucket.mine           = 0;
+  fd_gui_timeline_root_slot( gui, &same_bucket );
+
   fd_gui_printf_timeline_query_agg( gui, "query_agg_shreds", "1s", 0UL,
                                     2L*FD_GUI_TIMELINE_DAY_NS-1000000000L,
                                     2UL, gui->summary.slot_rooted, 33UL );
   test_http_expect( http,
     "{\"topic\":\"timeline\",\"key\":\"query_agg_shreds\",\"id\":33,\"value\":{\"granularity\":\"1s\",\"reference_ts_ns\":\"172799000000000\",\"root_slot\":7000,\"shreds\":[1,2],\"turbine\":[10,11],\"repair\":[20,21],\"reconstructed\":[30,31],\"published\":[0,0]}}" );
 
+  fd_gui_printf_timeline_query_agg( gui, "query_agg_slots", "1s", 0UL,
+                                    2L*FD_GUI_TIMELINE_DAY_NS-1000000000L,
+                                    3UL, gui->summary.slot_rooted, 32UL );
+  test_http_expect( http,
+    "{\"topic\":\"timeline\",\"key\":\"query_agg_slots\",\"id\":32,\"value\":{\"granularity\":\"1s\",\"reference_ts_ns\":\"172799000000000\",\"start_slot\":[6000,6001,null],\"end_slot\":[6000,6003,null]}}" );
+
   fd_gui_printf_timeline_query_agg( gui, "query_agg_compute", "1s", 0UL,
                                     2L*FD_GUI_TIMELINE_DAY_NS-1000000000L,
                                     2UL, ULONG_MAX, 34UL );
   test_http_expect( http,
     "{\"topic\":\"timeline\",\"key\":\"query_agg_compute\",\"id\":34,\"value\":{\"granularity\":\"1s\",\"reference_ts_ns\":\"172799000000000\",\"root_slot\": null,\"compute_units\":[null,null],\"max_compute_units\": null}}" );
+
+  fd_gui_printf_timeline_query_agg( gui, "query_agg_slots", "1s", 0UL,
+                                    2L*FD_GUI_TIMELINE_DAY_NS-1000000000L,
+                                    2UL, ULONG_MAX, 31UL );
+  test_http_expect( http,
+    "{\"topic\":\"timeline\",\"key\":\"query_agg_slots\",\"id\":31,\"value\":{\"granularity\":\"1s\",\"reference_ts_ns\":\"172799000000000\",\"start_slot\":[null,null],\"end_slot\":[null,null]}}" );
 
   /* Full websocket dispatch covers strict decimal parsing and the inclusive
      150-bucket limit.  The synthetic websocket is closed, so successful
@@ -263,6 +299,7 @@ test_timeline_queries( fd_gui_t * gui ) {
     char const * _json = (json);                                                   \
     FD_TEST( fd_gui_ws_message( gui, 0UL, (uchar const *)_json, strlen( _json ) )==(expect) ); \
   } while(0)
+  WS_REQ( "{\"topic\":\"timeline\",\"key\":\"query_agg_slots\",\"id\":1,\"params\":{\"start_ns\":\"0\",\"end_ns\":\"149000000000\",\"granularity\":\"1s\"}}", 0 );
   WS_REQ( "{\"topic\":\"timeline\",\"key\":\"query_agg_revenue\",\"id\":1,\"params\":{\"start_ns\":\"0\",\"end_ns\":\"149000000000\",\"granularity\":\"1s\"}}", 0 );
   WS_REQ( "{\"topic\":\"timeline\",\"key\":\"query_agg_revenue\",\"id\":1,\"params\":{\"start_ns\":\"0\",\"end_ns\":\"150000000000\",\"granularity\":\"1s\"}}", FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST );
   WS_REQ( "{\"topic\":\"timeline\",\"key\":\"query_agg_revenue\",\"id\":1,\"params\":{\"start_ns\":0,\"end_ns\":\"1\",\"granularity\":\"1s\"}}", FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST );
@@ -273,7 +310,7 @@ test_timeline_queries( fd_gui_t * gui ) {
 
   gui->http = NULL;
   free( fd_http_server_delete( fd_http_server_leave( http ) ) );
-  FD_LOG_NOTICE(( "test_timeline_queries: ok" ));
+  FD_LOG_NOTICE(( "test_timeline_agg_queries: ok" ));
 }
 
 static void
@@ -382,6 +419,8 @@ test_timeline_aggregates( fd_gui_t * gui ) {
   FD_TEST( day );
   for( ulong g=0UL; g<FD_GUI_TIMELINE_GRANULARITY_CNT; g++ ) {
     ulong idx = fd_gui_timeline_granularity_off[ g ]+1500000000UL/fd_gui_timeline_granularity_ns[ g ];
+    FD_TEST( day->start_slot   [ idx ]==newer );
+    FD_TEST( day->end_slot     [ idx ]==newer );
     FD_TEST( day->shreds       [ idx ]==100UL );
     FD_TEST( day->turbine      [ idx ]==70UL  );
     FD_TEST( day->repair       [ idx ]==20UL  );
@@ -452,7 +491,10 @@ test_evict_oldest_epoch( fd_gui_t * gui ) {
   for( ulong sec=86390UL; sec<=86419UL; sec++ ) append_sched_counts( gui, sec_ns( sec ) );
 
   /* shred events: one per slot at the slot's own completion second */
-  for( ulong s=A_START_SLOT; s<=C_END_SLOT; s++ ) append_shred( gui, epoch_slot_complete_ns( s ), s );
+  for( ulong s=A_START_SLOT; s<=C_END_SLOT; s++ ) {
+    append_shred( gui, epoch_slot_complete_ns( s ), s );
+    append_replay_txn( gui, epoch_slot_complete_ns( s ), s );
+  }
 
   /* boundary case: a shred for epoch B's first slot (1010) that landed in
      window 86399 -- the same second as epoch A's last slot (1009).  Eviction
@@ -460,15 +502,21 @@ test_evict_oldest_epoch( fd_gui_t * gui ) {
      (1010 > 1009) must keep this row. */
   append_shred( gui, sec_ns( 86399UL ), B_START_SLOT );
 
-  /* Day zero is owned exclusively by epoch A.  Day one contains data
-     populated by test_timeline_queries and must survive with epoch B. */
+  /* Day zero is owned exclusively by epoch A.  Day one belongs to epoch B
+     and must survive eviction of epoch A. */
   fd_gui_slot_t timeline_slot;
   memset( &timeline_slot, 0xFF, sizeof(timeline_slot) );
+  timeline_slot.slot           = A_END_SLOT;
+  timeline_slot.parent_slot    = A_END_SLOT-1UL;
   timeline_slot.completed_time = sec_ns( 86399UL );
   timeline_slot.skip           = FD_GUI_SKIP_STATUS_NOT_SKIPPED;
   timeline_slot.mine           = 0;
   timeline_slot.shred_cnt      = 1U;
   timeline_slot.block_shred_cnt= 1U;
+  fd_gui_timeline_root_slot( gui, &timeline_slot );
+  timeline_slot.slot           = B_START_SLOT;
+  timeline_slot.parent_slot    = A_END_SLOT;
+  timeline_slot.completed_time = sec_ns( 86400UL );
   fd_gui_timeline_root_slot( gui, &timeline_slot );
   FD_TEST( timeline_day_present( gui, 0UL ) );
   FD_TEST( timeline_day_present( gui, 1UL ) );
@@ -487,6 +535,7 @@ test_evict_oldest_epoch( fd_gui_t * gui ) {
   FD_TEST( count_ts( gui, FD_GUI_HIST_SCHEDULER_COUNTS, ULONG_MAX )==30UL ); /* secs 10..39 */
   FD_TEST( count_ts( gui, FD_GUI_HIST_SHRED_EVENTS,     ULONG_MAX )==31UL ); /* 30 slots + 1 boundary */
   FD_TEST( count_ts( gui, FD_GUI_HIST_SHRED_EVENTS,     B_START_SLOT )==2UL ); /* slot 1010: its own + boundary */
+  FD_TEST( count_ts( gui, FD_GUI_HIST_REPLAY_TXN,       ULONG_MAX )==30UL );
 
   /* --- evict the oldest epoch (A); B and C stay resident (the current +
      next epochs the floor protects) --------------------------------- */
@@ -510,6 +559,7 @@ test_evict_oldest_epoch( fd_gui_t * gui ) {
 
   /* time-series: epoch A's ten windows are gone and epochs B+C stay. */
   FD_TEST( count_ts( gui, FD_GUI_HIST_SCHEDULER_COUNTS, ULONG_MAX )==20UL );
+  FD_TEST( count_ts( gui, FD_GUI_HIST_REPLAY_TXN,       ULONG_MAX )==20UL );
 
   /* shred events: TS eviction is an approximate watermark advance (a
      monotonic prefix bump on the partition's evict_cur), not a precise
@@ -536,6 +586,7 @@ test_evict_oldest_epoch( fd_gui_t * gui ) {
   FD_TEST( epoch_present( gui, EPOCH_C ) );
   FD_TEST( count_ts( gui, FD_GUI_HIST_SCHEDULER_COUNTS, ULONG_MAX )==20UL );
   FD_TEST( count_ts( gui, FD_GUI_HIST_SHRED_EVENTS,     ULONG_MAX )==21UL );
+  FD_TEST( count_ts( gui, FD_GUI_HIST_REPLAY_TXN,       ULONG_MAX )==20UL );
 
   FD_LOG_NOTICE(( "test_evict_oldest_epoch: ok" ));
 }
@@ -831,6 +882,320 @@ store_close( test_store_t * s ) {
   rm_tmpdir( s->path );
 }
 
+static void
+test_timeline_queries( fd_gui_t * gui ) {
+  long const start_ns = 10000000000L;
+  long const end_ns   = start_ns + 1000L;
+
+  fd_gui_store_replay_txn_t a = {
+    .completion_time_ns      = start_ns,
+    .slot                    = 11UL,
+    .txn_idx                 = 2UL,
+    .txn_exec_idx            = 1UL,
+    .sigverify_start_ns      = start_ns-5L,
+    .sigverify_end_ns        = start_ns,
+    .exec_start_ns           = start_ns-4L,
+    .load_start_ns           = start_ns-3L,
+    .check_start_ns          = start_ns-2L,
+    .execute_start_ns        = LONG_MAX,
+    .commit_start_ns         = LONG_MAX,
+    .commit_end_ns           = start_ns-1L,
+    .transaction_fee         = 5000UL,
+    .priority_fee            = 1200UL,
+    .tips                    = 7UL,
+    .compute_units_requested = 3428U,
+    .compute_units_consumed  = 3000U,
+    .error_code              = 9U,
+    .is_committable          = 1U,
+    .is_fees_only            = 0U,
+    .is_simple_vote          = 1U
+  };
+  fd_gui_store_replay_txn_t b = {
+    .completion_time_ns      = end_ns,
+    .slot                    = 10UL,
+    .txn_idx                 = 5UL,
+    .txn_exec_idx            = 0UL,
+    .sigverify_start_ns      = start_ns-10L,
+    .sigverify_end_ns        = end_ns-1L,
+    .exec_start_ns           = start_ns-9L,
+    .load_start_ns           = start_ns-8L,
+    .check_start_ns          = LONG_MAX,
+    .execute_start_ns        = start_ns-7L,
+    .commit_start_ns         = start_ns-6L,
+    .commit_end_ns           = end_ns,
+    .transaction_fee         = 0UL,
+    .priority_fee            = 0UL,
+    .tips                    = 0UL,
+    .compute_units_requested = 0U,
+    .compute_units_consumed  = 0U,
+    .error_code              = 3U,
+    .is_committable          = 0U,
+    .is_fees_only            = 0U,
+    .is_simple_vote          = 0U
+  };
+  fd_gui_store_replay_txn_t outside = b;
+  outside.completion_time_ns = end_ns+1L;
+  outside.slot               = 12UL;
+  outside.txn_idx            = 99UL;
+
+  FD_TEST( !fd_gui_hist_ts_append( gui, FD_GUI_HIST_REPLAY_TXN, a.completion_time_ns,       a.completion_time_ns,       &a       ) );
+  FD_TEST( !fd_gui_hist_ts_append( gui, FD_GUI_HIST_REPLAY_TXN, b.completion_time_ns,       b.completion_time_ns,       &b       ) );
+  FD_TEST( !fd_gui_hist_ts_append( gui, FD_GUI_HIST_REPLAY_TXN, outside.completion_time_ns, outside.completion_time_ns, &outside ) );
+
+  fd_http_server_params_t params = {
+    .max_connection_cnt    = 1UL,
+    .max_ws_connection_cnt = 1UL,
+    .max_request_len       = 1024UL,
+    .max_ws_recv_frame_len = 1024UL,
+    .max_ws_send_frame_cnt = 1UL,
+    .outgoing_buffer_sz    = FD_GUI_TIMELINE_QUERY_MIN_SEND_BUFFER_SZ
+  };
+  fd_http_server_callbacks_t callbacks = {0};
+  ulong http_footprint = fd_http_server_footprint( params );
+  void * http_mem = aligned_alloc( fd_http_server_align(), fd_ulong_align_up( http_footprint, fd_http_server_align() ) );
+  FD_TEST( http_mem );
+  gui->http = fd_http_server_join( fd_http_server_new( http_mem, params, callbacks, NULL ) );
+  FD_TEST( gui->http );
+
+  fd_wksp_t * wksp = fd_wksp_new_anonymous( FD_SHMEM_NORMAL_PAGE_SZ, 4096UL, 0UL, "gui_query", 0UL );
+  FD_TEST( wksp );
+  void * alloc_mem = fd_wksp_alloc_laddr( wksp, fd_alloc_align(), fd_alloc_footprint(), 1UL );
+  FD_TEST( alloc_mem );
+  gui->alloc = fd_alloc_join( fd_alloc_new( alloc_mem, 1UL ), 0UL );
+  FD_TEST( gui->alloc );
+
+  ulong txn_reads = fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ];
+  FD_TEST( !fd_gui_printf_timeline_query_txns( gui, "timeline", "query_txn_timestamps", start_ns, end_ns, 34UL ) );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ]==txn_reads+1UL );
+  FD_TEST( !gui->http->stage_err );
+  char * json = malloc( gui->http->stage_len+1UL );
+  FD_TEST( json );
+  fd_memcpy( json, gui->http->oring+(gui->http->stage_off%gui->http->oring_sz), gui->http->stage_len );
+  json[ gui->http->stage_len ] = '\0';
+
+  FD_TEST( strstr( json, "\"topic\":\"timeline\",\"key\":\"query_txn_timestamps\",\"id\":34" ) );
+  FD_TEST( strstr( json, "\"reference_slot\":10,\"reference_ts\":\"9999999990\"" ) );
+  FD_TEST( strstr( json, "\"slot_delta\":[0,1]" ) );
+  FD_TEST( strstr( json, "\"txn_idx\":[5,2]" ) );
+  FD_TEST( strstr( json, "\"txn_exec_idx\":[0,1]" ) );
+  FD_TEST( strstr( json, "\"txn_sigverify_start_ts_delta\":[\"0\",\"5\"]" ) );
+  FD_TEST( strstr( json, "\"txn_check_start_ts_delta\":[null,\"8\"]" ) );
+  FD_TEST( strstr( json, "\"txn_execute_start_ts_delta\":[\"3\",null]" ) );
+  FD_TEST( strstr( json, "\"txn_commit_start_ts_delta\":[\"4\",null]" ) );
+  FD_TEST( strstr( json, "\"txn_commit_end_ts_delta\":[\"1010\",\"9\"]" ) );
+  FD_TEST( !strstr( json, "\"txn_signature\"" ) );
+  FD_TEST( !strstr( json, "\"txn_compute_units_requested\"" ) );
+  FD_TEST( !strstr( json, "\"txn_microblock_id\"" ) );
+  FD_TEST( !strstr( json, "\"txn_exec_tile_idx\"" ) );
+  free( json );
+
+  fd_http_server_unstage( gui->http );
+  txn_reads = fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ];
+  FD_TEST( !fd_gui_printf_timeline_query_txns( gui, "timeline", "query_txn_meta", start_ns, end_ns, 35UL ) );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ]==txn_reads+1UL );
+  FD_TEST( !gui->http->stage_err );
+  json = malloc( gui->http->stage_len+1UL );
+  FD_TEST( json );
+  fd_memcpy( json, gui->http->oring+(gui->http->stage_off%gui->http->oring_sz), gui->http->stage_len );
+  json[ gui->http->stage_len ] = '\0';
+
+  FD_TEST( strstr( json, "\"topic\":\"timeline\",\"key\":\"query_txn_meta\",\"id\":35" ) );
+  FD_TEST( strstr( json, "\"reference_slot\":10,\"reference_ts\":\"9999999990\"" ) );
+  FD_TEST( strstr( json, "\"slot_delta\":[0,1]" ) );
+  FD_TEST( strstr( json, "\"txn_idx\":[5,2]" ) );
+  FD_TEST( strstr( json, "\"txn_exec_idx\":[0,1]" ) );
+  FD_TEST( strstr( json, "\"txn_compute_units_requested\":[null,3428]" ) );
+  FD_TEST( strstr( json, "\"txn_transaction_fee\":[\"0\",\"5000\"]" ) );
+  FD_TEST( strstr( json, "\"txn_error_code\":[3,9]" ) );
+  FD_TEST( strstr( json, "\"txn_is_committable\":[false,true]" ) );
+  FD_TEST( !strstr( json, "\"txn_sigverify_start_ts_delta\"" ) );
+  FD_TEST( !strstr( json, "\"txn_commit_end_ts_delta\"" ) );
+  FD_TEST( !strstr( json, "\"txn_microblock_id\"" ) );
+  FD_TEST( !strstr( json, "\"txn_exec_tile_idx\"" ) );
+  free( json );
+
+  fd_http_server_unstage( gui->http );
+  FD_TEST( !fd_gui_printf_timeline_query_txns( gui, "timeline", "query_txn_meta", end_ns+2L, end_ns+3L, 36UL ) );
+  FD_TEST( !gui->http->stage_err );
+  json = malloc( gui->http->stage_len+1UL );
+  FD_TEST( json );
+  fd_memcpy( json, gui->http->oring+(gui->http->stage_off%gui->http->oring_sz), gui->http->stage_len );
+  json[ gui->http->stage_len ] = '\0';
+  FD_TEST( strstr( json, "\"reference_slot\": null,\"reference_ts\": null,\"slot_delta\":[]" ) );
+  free( json );
+
+  /* Replay transaction timestamps come from the local monotonic clock and
+     remain exact even if the GUI consumes the notification much later. */
+  fd_http_server_unstage( gui->http );
+  long const lagged_ts = 2000000000000L;
+  fd_gui_store_replay_txn_t lagged = b;
+  lagged.completion_time_ns = lagged_ts;
+  lagged.slot               = 13UL;
+  lagged.txn_idx            = 7UL;
+  lagged.sigverify_start_ns = lagged_ts-10L;
+  lagged.sigverify_end_ns   = lagged_ts-1L;
+  lagged.exec_start_ns      = lagged_ts-9L;
+  lagged.load_start_ns      = lagged_ts-8L;
+  lagged.check_start_ns     = LONG_MAX;
+  lagged.execute_start_ns   = lagged_ts-7L;
+  lagged.commit_start_ns    = lagged_ts-6L;
+  lagged.commit_end_ns      = lagged_ts;
+  FD_TEST( !fd_gui_hist_ts_append( gui, FD_GUI_HIST_REPLAY_TXN,
+                                   lagged_ts+100000000000L, lagged_ts, &lagged ) );
+
+  /* Make the exact timestamp an append-order interior extreme.  Endpoint
+     bounds alone would miss it; conservative observed extrema must not. */
+  fd_gui_store_replay_txn_t lagged_tail = lagged;
+  lagged_tail.completion_time_ns = 1000000000000L;
+  FD_TEST( !fd_gui_hist_ts_append( gui, FD_GUI_HIST_REPLAY_TXN,
+                                   lagged_tail.completion_time_ns,
+                                   lagged_tail.completion_time_ns,
+                                   &lagged_tail ) );
+  FD_TEST( !fd_gui_printf_timeline_query_txns( gui, "timeline", "query_txn_timestamps", lagged_ts, lagged_ts, 36UL ) );
+  json = malloc( gui->http->stage_len+1UL );
+  FD_TEST( json );
+  fd_memcpy( json, gui->http->oring+(gui->http->stage_off%gui->http->oring_sz), gui->http->stage_len );
+  json[ gui->http->stage_len ] = '\0';
+  FD_TEST( strstr( json, "\"txn_idx\":[7]" ) );
+  free( json );
+
+  fd_http_server_unstage( gui->http );
+  char const request_wide[] =
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_timestamps\",\"id\":36,"
+    "\"params\":{\"start_ns\":\"10000000000\",\"end_ns\":\"26000000000\"}}";
+  FD_TEST( !fd_gui_ws_message( gui, 0UL, (uchar const *)request_wide, sizeof(request_wide)-1UL ) );
+
+  char const request_wider[] =
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_meta\",\"id\":37,"
+    "\"params\":{\"start_ns\":\"10000000000\",\"end_ns\":\"26000000001\"}}";
+  FD_TEST( !fd_gui_ws_message( gui, 0UL, (uchar const *)request_wider, sizeof(request_wider)-1UL ) );
+
+  char const request_removed[] =
+    "{\"topic\":\"timeline\",\"key\":\"query_transactions\",\"id\":38,"
+    "\"params\":{\"start_ns\":\"10000000000\",\"end_ns\":\"26000000001\"}}";
+  FD_TEST( fd_gui_ws_message( gui, 0UL, (uchar const *)request_removed, sizeof(request_removed)-1UL )==
+           FD_HTTP_SERVER_CONNECTION_CLOSE_UNKNOWN_METHOD );
+
+  char const * invalid_requests[] = {
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_timestamps\",\"id\":38,\"params\":{\"start_ns\":1,\"end_ns\":\"2\"}}",
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_meta\",\"id\":38,\"params\":{\"start_ns\":\"\",\"end_ns\":\"2\"}}",
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_timestamps\",\"id\":38,\"params\":{\"start_ns\":\"-1\",\"end_ns\":\"2\"}}",
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_meta\",\"id\":38,\"params\":{\"start_ns\":\"1x\",\"end_ns\":\"2\"}}",
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_timestamps\",\"id\":38,\"params\":{\"start_ns\":\"1\\u0000junk\",\"end_ns\":\"2\"}}",
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_meta\",\"id\":38,\"params\":{\"start_ns\":\"9223372036854775807\",\"end_ns\":\"9223372036854775807\"}}",
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_timestamps\",\"id\":38,\"params\":{\"start_ns\":\"2\",\"end_ns\":\"1\"}}"
+  };
+  for( ulong i=0UL; i<sizeof(invalid_requests)/sizeof(invalid_requests[ 0 ]); i++ )
+    FD_TEST( fd_gui_ws_message( gui, 0UL, (uchar const *)invalid_requests[ i ], strlen( invalid_requests[ i ] ) )==
+             FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST );
+
+  static uchar const request_literal_nul[] =
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_meta\",\"id\":38,"
+    "\"params\":{\"start_ns\":\"1\0junk\",\"end_ns\":\"2\"}}";
+  FD_TEST( fd_gui_ws_message( gui, 0UL, request_literal_nul, sizeof(request_literal_nul)-1UL )==
+           FD_HTTP_SERVER_CONNECTION_CLOSE_BAD_REQUEST );
+
+  /* A wide range entirely outside retained history is rejected by the live
+     bounds without opening a store scan. */
+  long future_start = LONG_MAX-10000000000000000L;
+  long future_end   = LONG_MAX-1L;
+  txn_reads = fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ];
+  FD_TEST( !fd_gui_printf_timeline_query_txns( gui, "timeline", "query_txn_meta", future_start, future_end, 39UL ) );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ]==txn_reads );
+  fd_http_server_unstage( gui->http );
+
+  /* Exactly the transaction limit succeeds in one scan; limit+1 produces a
+     small error envelope with no partial value. */
+  long const txn_limit_ts = 100000000000L;
+  for( ulong i=0UL; i<FD_GUI_TIMELINE_QUERY_TRANSACTION_MAX; i++ ) append_replay_txn( gui, txn_limit_ts, i );
+  append_replay_txn( gui, txn_limit_ts+1L, FD_GUI_TIMELINE_QUERY_TRANSACTION_MAX );
+
+  txn_reads = fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ];
+  ulong txn_read_records = fd_gui_store_metrics( gui->db )->ts_read_records[ FD_GUI_HIST_REPLAY_TXN ];
+  FD_TEST( !fd_gui_printf_timeline_query_txns( gui, "timeline", "query_txn_timestamps", txn_limit_ts, txn_limit_ts, 40UL ) );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ]==txn_reads+1UL );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_read_records[ FD_GUI_HIST_REPLAY_TXN ]==txn_read_records+FD_GUI_TIMELINE_QUERY_TRANSACTION_MAX+1UL );
+  FD_TEST( !gui->http->stage_err && gui->http->stage_len<FD_GUI_TIMELINE_QUERY_MIN_SEND_BUFFER_SZ );
+  gui->http->ws_conns[ 0 ].compress_websocket = 1;
+  FD_TEST( !fd_http_server_ws_send( gui->http, 0UL ) );
+  FD_TEST( !gui->http->stage_err && !gui->http->stage_len && !gui->http->stage_comp_len );
+
+  txn_reads        = fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ];
+  txn_read_records = fd_gui_store_metrics( gui->db )->ts_read_records[ FD_GUI_HIST_REPLAY_TXN ];
+  FD_TEST( !fd_gui_printf_timeline_query_txns( gui, "timeline", "query_txn_meta", txn_limit_ts, txn_limit_ts+1L, 41UL ) );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_REPLAY_TXN ]==txn_reads+1UL );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_read_records[ FD_GUI_HIST_REPLAY_TXN ]==txn_read_records+FD_GUI_TIMELINE_QUERY_TRANSACTION_MAX+1UL );
+  json = malloc( gui->http->stage_len+1UL );
+  FD_TEST( json );
+  fd_memcpy( json, gui->http->oring+(gui->http->stage_off%gui->http->oring_sz), gui->http->stage_len );
+  json[ gui->http->stage_len ] = '\0';
+  FD_TEST( strstr( json, "\"error\":{\"code\":\"result_limit_exceeded\"}" ) );
+  FD_TEST( !strstr( json, "\"max_records\"" ) );
+  FD_TEST( strstr( json, "\"topic\":\"timeline\",\"key\":\"query_txn_meta\",\"id\":41" ) );
+  FD_TEST( !strstr( json, "\"value\"" ) );
+  free( json );
+  fd_http_server_unstage( gui->http );
+
+  /* Apply the same one-scan and exact-limit behavior to shred rows. */
+  long const shred_limit_ts = 200000000000L;
+  for( ulong i=0UL; i<FD_GUI_TIMELINE_QUERY_SHRED_MAX; i++ ) append_shred( gui, shred_limit_ts, 1UL );
+  append_shred( gui, shred_limit_ts+1L, 1UL );
+
+  ulong shred_reads        = fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_SHRED_EVENTS ];
+  ulong shred_read_records = fd_gui_store_metrics( gui->db )->ts_read_records[ FD_GUI_HIST_SHRED_EVENTS ];
+  FD_TEST( !fd_gui_printf_timeline_query_shreds( gui, "timeline", shred_limit_ts, shred_limit_ts, 42UL ) );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_SHRED_EVENTS ]==shred_reads+1UL );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_read_records[ FD_GUI_HIST_SHRED_EVENTS ]==shred_read_records+FD_GUI_TIMELINE_QUERY_SHRED_MAX+1UL );
+  FD_TEST( !gui->http->stage_err && gui->http->stage_len<FD_GUI_TIMELINE_QUERY_MIN_SEND_BUFFER_SZ );
+  FD_TEST( !fd_http_server_ws_send( gui->http, 0UL ) );
+  FD_TEST( !gui->http->stage_err && !gui->http->stage_len && !gui->http->stage_comp_len );
+
+  shred_reads        = fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_SHRED_EVENTS ];
+  shred_read_records = fd_gui_store_metrics( gui->db )->ts_read_records[ FD_GUI_HIST_SHRED_EVENTS ];
+  FD_TEST( !fd_gui_printf_timeline_query_shreds( gui, "timeline", shred_limit_ts, shred_limit_ts+1L, 43UL ) );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_reads[ FD_GUI_HIST_SHRED_EVENTS ]==shred_reads+1UL );
+  FD_TEST( fd_gui_store_metrics( gui->db )->ts_read_records[ FD_GUI_HIST_SHRED_EVENTS ]==shred_read_records+FD_GUI_TIMELINE_QUERY_SHRED_MAX+1UL );
+  json = malloc( gui->http->stage_len+1UL );
+  FD_TEST( json );
+  fd_memcpy( json, gui->http->oring+(gui->http->stage_off%gui->http->oring_sz), gui->http->stage_len );
+  json[ gui->http->stage_len ] = '\0';
+  FD_TEST( strstr( json, "\"error\":{\"code\":\"result_limit_exceeded\"}" ) );
+  FD_TEST( !strstr( json, "\"max_records\"" ) );
+  FD_TEST( !strstr( json, "\"value\"" ) );
+  free( json );
+  fd_http_server_unstage( gui->http );
+
+  /* If staging unexpectedly fails, the request reports a connection-local
+     close reason instead of terminating the tile. */
+  fd_http_server_t * normal_http = gui->http;
+  fd_http_server_params_t tiny_params = params;
+  tiny_params.outgoing_buffer_sz = 32UL;
+  ulong tiny_http_footprint = fd_http_server_footprint( tiny_params );
+  void * tiny_http_mem = aligned_alloc( fd_http_server_align(), fd_ulong_align_up( tiny_http_footprint, fd_http_server_align() ) );
+  FD_TEST( tiny_http_mem );
+  gui->http = fd_http_server_join( fd_http_server_new( tiny_http_mem, tiny_params, callbacks, NULL ) );
+  FD_TEST( gui->http );
+  char const tiny_request[] =
+    "{\"topic\":\"timeline\",\"key\":\"query_txn_meta\",\"id\":44,"
+    "\"params\":{\"start_ns\":\"300000000000\",\"end_ns\":\"300000000001\"}}";
+  FD_TEST( fd_gui_ws_message( gui, 0UL, (uchar const *)tiny_request, sizeof(tiny_request)-1UL )==
+           FD_HTTP_SERVER_CONNECTION_CLOSE_EVICTED );
+  FD_TEST( !gui->http->stage_err && !gui->http->stage_len );
+  fd_http_server_delete( fd_http_server_leave( gui->http ) );
+  free( tiny_http_mem );
+  gui->http = normal_http;
+
+  FD_TEST( fd_alloc_delete( fd_alloc_leave( gui->alloc ) )==alloc_mem );
+  fd_wksp_free_laddr( alloc_mem );
+  fd_wksp_delete_anonymous( wksp );
+  fd_http_server_delete( fd_http_server_leave( gui->http ) );
+  free( http_mem );
+  gui->alloc = NULL;
+  gui->http  = NULL;
+
+  FD_LOG_NOTICE(( "test_timeline_queries: ok" ));
+}
+
 /* ---- space-pressure trigger ------------------------------------------
 
    The space-pressure *trigger* (high-water threshold via
@@ -848,10 +1213,18 @@ main( int     argc,
      eviction is driven directly via fd_gui_hist_evict_oldest.  Each test gets
      its own store so leftover epochs don't perturb the next (eviction now
      keeps the last epoch, so stores do not empty between tests). */
+  test_store_t sa[ 1 ];
+  store_open( sa, 1UL<<30, 0 );
+  test_timeline_aggregates( sa->gui );
+  store_close( sa );
+
+  test_store_t sq[ 1 ];
+  store_open( sq, 1UL<<30, 0 );
+  test_timeline_agg_queries( sq->gui );
+  store_close( sq );
+
   test_store_t s0[ 1 ];
   store_open( s0, 1UL<<30, 0 );
-  test_timeline_aggregates( s0->gui );
-  test_timeline_queries( s0->gui );
   test_evict_oldest_epoch( s0->gui );
   store_close( s0 );
 
@@ -884,6 +1257,11 @@ main( int     argc,
   store_open( s4, 1UL<<30, 5 );
   test_epoch_region_reclaimed( s4->gui );
   store_close( s4 );
+
+  test_store_t s5[ 1 ];
+  store_open( s5, 1UL<<30, 7 );
+  test_timeline_queries( s5->gui );
+  store_close( s5 );
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

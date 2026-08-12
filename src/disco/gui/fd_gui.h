@@ -18,10 +18,16 @@
 #include "../../flamenco/leaders/fd_leaders.h"
 #include "../../flamenco/runtime/sysvar/fd_sysvar_epoch_schedule.h" /* fd_slot_to_epoch */
 #include "../../util/fd_util_base.h"
+#include "../../util/alloc/fd_alloc.h"
 #include "../../util/hist/fd_histf.h"
 #include "../../waltz/http/fd_http_server.h"
 #include "../../flamenco/accdb/fd_accdb_cache.h"
 #include "../../flamenco/accdb/fd_accdb_shmem.h"
+
+/* Maximum logical rows returned by the timeline query endpoints. */
+#define FD_GUI_TIMELINE_QUERY_TRANSACTION_MAX (65536UL)
+#define FD_GUI_TIMELINE_QUERY_SHRED_MAX       (524288UL)
+#define FD_GUI_TIMELINE_QUERY_MIN_SEND_BUFFER_SZ (128UL<<20)
 
 
 
@@ -198,6 +204,9 @@ extern ulong const fd_gui_timeline_granularity_off[ FD_GUI_TIMELINE_GRANULARITY_
 
 struct fd_gui_timeline_day {
   ulong day; /* days since the UNIX epoch */
+  /* Inclusive rooted slot range assigned to each bucket, or ULONG_MAX when empty. */
+  ulong start_slot     [ FD_GUI_TIMELINE_BUCKET_CNT ];
+  ulong end_slot       [ FD_GUI_TIMELINE_BUCKET_CNT ];
   ulong shreds         [ FD_GUI_TIMELINE_BUCKET_CNT ];
   ulong turbine        [ FD_GUI_TIMELINE_BUCKET_CNT ];
   ulong repair         [ FD_GUI_TIMELINE_BUCKET_CNT ];
@@ -506,6 +515,38 @@ struct __attribute__((packed)) fd_gui_store_txn_end {
   uchar flags;                  /* ENDED | LANDED_IN_BLOCK */
 };
 typedef struct fd_gui_store_txn_end fd_gui_store_txn_end_t;
+
+/* A fully joined replay transaction.  completion_time_ns is the later
+   of signature-verification completion and runtime commit/cancel
+   completion and is the time-series index for this record. */
+
+struct __attribute__((packed)) fd_gui_store_replay_txn {
+  long  completion_time_ns;
+  ulong slot;
+  ulong txn_idx;
+  ulong txn_exec_idx;
+  uchar signature[ FD_TXN_SIGNATURE_SZ ];
+
+  long sigverify_start_ns;
+  long sigverify_end_ns;
+  long exec_start_ns;
+  long load_start_ns;
+  long check_start_ns;
+  long execute_start_ns;
+  long commit_start_ns;
+  long commit_end_ns;
+
+  ulong transaction_fee;
+  ulong priority_fee;
+  ulong tips;
+  uint  compute_units_requested; /* 0 means unavailable */
+  uint  compute_units_consumed;
+  uint  error_code;
+  uchar is_committable;
+  uchar is_fees_only;
+  uchar is_simple_vote;
+};
+typedef struct fd_gui_store_replay_txn fd_gui_store_replay_txn_t;
 
 struct fd_gui_slot_txn_join {
   fd_gui_store_txn_start_t const * start;
@@ -892,6 +933,7 @@ typedef struct fd_gui_summary fd_gui_summary_t;
 
 struct fd_gui {
   fd_http_server_t * http;
+  fd_alloc_t *       alloc;
   fd_topo_t const * topo;
   fd_accdb_shmem_t const * accdb_shmem;
 
@@ -1008,6 +1050,7 @@ fd_gui_new( void *                   shmem,
             char const *             accounts_database_path,
             char const *             gui_database_path,
             void *                   db,
+            fd_alloc_t *             alloc,
             fd_topo_t const *        topo,
             fd_accdb_shmem_t const * accdb_shmem,
             long                     now );
@@ -1149,6 +1192,11 @@ fd_gui_handle_replay_update( fd_gui_t *                         gui,
                              fd_replay_slot_completed_t const * slot_completed,
                              ulong                              vote_slot,
                              long                               now );
+
+void
+fd_gui_handle_replay_txn( fd_gui_t *                         gui,
+                          fd_replay_txn_executed_t const * txn,
+                          long                               now );
 
 void
 fd_gui_stage_landed_vote( fd_gui_t * gui,

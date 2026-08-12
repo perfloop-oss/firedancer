@@ -672,6 +672,12 @@ fd_gui_printf_epoch( fd_gui_t * gui,
       else                                                jsonp_null( gui->http, "end_time_nanos" );
       jsonp_ulong( gui->http, "start_slot",              FD_LIKELY( meta ) ? meta->start_slot : 0UL );
       jsonp_ulong( gui->http, "end_slot",                FD_LIKELY( meta ) ? meta->start_slot+meta->slot_cnt-1UL : 0UL );
+      jsonp_open_object( gui->http, "epoch_schedule" );
+        jsonp_ulong( gui->http, "slots_per_epoch",    FD_LIKELY( meta ) ? meta->epoch_schedule.slots_per_epoch    : 0UL );
+        jsonp_ulong( gui->http, "first_normal_epoch", FD_LIKELY( meta ) ? meta->epoch_schedule.first_normal_epoch : 0UL );
+        jsonp_ulong( gui->http, "first_normal_slot",  FD_LIKELY( meta ) ? meta->epoch_schedule.first_normal_slot  : 0UL );
+        jsonp_bool(  gui->http, "warmup",             FD_LIKELY( meta ) ? meta->epoch_schedule.warmup             : 0   );
+      jsonp_close_object( gui->http );
       jsonp_ulong( gui->http, "target_slot_duration_nanos", FD_LIKELY( meta ) ? (ulong)meta->target_slot_duration_ns : LONG_MAX );
       jsonp_ulong_as_str( gui->http, "excluded_stake_lamports", 0UL );
       ulong pub_cnt    = FD_LIKELY( meta ) ? meta->pub_cnt : 0UL;
@@ -2971,18 +2977,247 @@ fd_gui_printf_shred_rebroadcast( fd_gui_t * gui, long after, long before ) {
   jsonp_close_envelope( gui->http );
 }
 
-void
+static void
+fd_gui_printf_timeline_result_limit_exceeded( fd_gui_t *   gui,
+                                               char const * topic,
+                                               char const * key,
+                                               ulong        id ) {
+  jsonp_open_envelope( gui->http, topic, key );
+    jsonp_ulong( gui->http, "id", id );
+    jsonp_open_object( gui->http, "error" );
+      jsonp_string( gui->http, "code", "result_limit_exceeded" );
+    jsonp_close_object( gui->http );
+  jsonp_close_envelope( gui->http );
+}
+
+typedef fd_gui_slot_history_shred_event_t const * fd_gui_shred_event_ptr_t;
+
+int
 fd_gui_printf_timeline_query_shreds( fd_gui_t *   gui,
                                      char const * topic,
                                      long         start_ns,
                                      long         end_ns,
                                      ulong        id ) {
+  ulong const ptr_cnt = FD_GUI_TIMELINE_QUERY_SHRED_MAX+1UL;
+  if( FD_UNLIKELY( !gui->alloc || ptr_cnt>ULONG_MAX/sizeof(fd_gui_shred_event_ptr_t) ) ) return -1;
+  fd_gui_shred_event_ptr_t * events = NULL;
+
+  ulong event_cnt = 0UL;
+  ulong min_slot  = ULONG_MAX;
+  long  min_ts    = LONG_MAX;
+  if( FD_LIKELY( gui->db ) ) {
+    fd_gui_hist_iter_t it;
+    if( FD_UNLIKELY( fd_gui_hist_range_begin( gui, &it, FD_GUI_HIST_SHRED_EVENTS, start_ns, end_ns, NULL, NULL ) ) ) {
+      return -1;
+    }
+    while( fd_gui_hist_range_next( &it ) ) {
+      fd_gui_slot_history_shred_event_t const * event = it.rec;
+      if( FD_UNLIKELY( event->timestamp<start_ns || event->timestamp>end_ns ) ) continue;
+      if( FD_UNLIKELY( !events ) ) {
+        events = fd_alloc_malloc( gui->alloc, alignof(fd_gui_shred_event_ptr_t), ptr_cnt*sizeof(fd_gui_shred_event_ptr_t) );
+        if( FD_UNLIKELY( !events ) ) {
+          fd_gui_hist_range_end( &it );
+          return -1;
+        }
+      }
+      events[ event_cnt++ ] = event;
+      if( FD_UNLIKELY( event_cnt>FD_GUI_TIMELINE_QUERY_SHRED_MAX ) ) break;
+      min_slot = fd_ulong_min( min_slot, event->slot      );
+      min_ts   = fd_long_min ( min_ts,   event->timestamp );
+    }
+    fd_gui_hist_range_end( &it );
+  }
+
+  if( FD_UNLIKELY( event_cnt>FD_GUI_TIMELINE_QUERY_SHRED_MAX ) ) {
+    if( FD_LIKELY( events ) ) fd_alloc_free( gui->alloc, events );
+    fd_gui_printf_timeline_result_limit_exceeded( gui, topic, "query_shreds", id );
+    return 0;
+  }
+
   jsonp_open_envelope( gui->http, topic, "query_shreds" );
     jsonp_ulong( gui->http, "id", id );
     jsonp_open_object( gui->http, "value" );
-      fd_gui_printf_shreds_window( gui, start_ns, end_ns );
+      jsonp_ulong      ( gui->http, "reference_slot", min_slot );
+      jsonp_long_as_str( gui->http, "reference_ts",   min_ts   );
+      jsonp_open_array( gui->http, "slot_delta" );
+        for( ulong i=0UL; i<event_cnt; i++ ) jsonp_ulong( gui->http, NULL, events[ i ]->slot-min_slot );
+      jsonp_close_array( gui->http );
+      jsonp_open_array( gui->http, "shred_idx" );
+        for( ulong i=0UL; i<event_cnt; i++ ) {
+          if( FD_LIKELY( events[ i ]->shred_idx!=USHORT_MAX ) ) jsonp_ulong( gui->http, NULL, events[ i ]->shred_idx );
+          else                                                  jsonp_null ( gui->http, NULL );
+        }
+      jsonp_close_array( gui->http );
+      jsonp_open_array( gui->http, "event" );
+        for( ulong i=0UL; i<event_cnt; i++ ) jsonp_ulong( gui->http, NULL, events[ i ]->event );
+      jsonp_close_array( gui->http );
+      jsonp_open_array( gui->http, "event_ts_delta" );
+        for( ulong i=0UL; i<event_cnt; i++ ) jsonp_long_as_str( gui->http, NULL, events[ i ]->timestamp-min_ts );
+      jsonp_close_array( gui->http );
     jsonp_close_object( gui->http );
   jsonp_close_envelope( gui->http );
+
+  if( FD_LIKELY( events ) ) fd_alloc_free( gui->alloc, events );
+  return 0;
+}
+
+typedef fd_gui_store_replay_txn_t const * fd_gui_replay_txn_ptr_t;
+
+#define SORT_NAME fd_gui_replay_txn_ptr_sort
+#define SORT_KEY_T fd_gui_replay_txn_ptr_t
+#define SORT_BEFORE(a,b) (((a)->slot<(b)->slot) || (((a)->slot==(b)->slot) && ((a)->txn_idx<(b)->txn_idx)))
+#include "../../util/tmpl/fd_sort.c"
+
+static inline void
+fd_gui_replay_txn_min_ts( long *                            min_ts,
+                          fd_gui_store_replay_txn_t const * txn ) {
+#define MIN_TS(field) do { if( txn->field!=LONG_MAX ) *min_ts = fd_long_min( *min_ts, txn->field ); } while(0)
+  MIN_TS( sigverify_start_ns );
+  MIN_TS( sigverify_end_ns   );
+  MIN_TS( exec_start_ns      );
+  MIN_TS( load_start_ns      );
+  MIN_TS( check_start_ns     );
+  MIN_TS( execute_start_ns   );
+  MIN_TS( commit_start_ns    );
+  MIN_TS( commit_end_ns      );
+#undef MIN_TS
+}
+
+int
+fd_gui_printf_timeline_query_txns( fd_gui_t *   gui,
+                                   char const * topic,
+                                   char const * key,
+                                   long         start_ns,
+                                   long         end_ns,
+                                   ulong        id ) {
+  int is_timestamps = !strcmp( key, "query_txn_timestamps" );
+  if( FD_UNLIKELY( !is_timestamps && strcmp( key, "query_txn_meta" ) ) ) return -1;
+
+  ulong const ptr_cnt = FD_GUI_TIMELINE_QUERY_TRANSACTION_MAX+1UL;
+  if( FD_UNLIKELY( !gui->alloc || ptr_cnt>ULONG_MAX/sizeof(fd_gui_replay_txn_ptr_t) ) ) return -1;
+  fd_gui_replay_txn_ptr_t * txns = NULL;
+
+  ulong txn_cnt = 0UL;
+  long  reference_ts = LONG_MAX;
+  if( FD_LIKELY( gui->db ) ) {
+    fd_gui_hist_iter_t it;
+    if( FD_UNLIKELY( fd_gui_hist_range_begin( gui, &it, FD_GUI_HIST_REPLAY_TXN, start_ns, end_ns, NULL, NULL ) ) ) {
+      return -1;
+    }
+    while( fd_gui_hist_range_next( &it ) ) {
+      fd_gui_store_replay_txn_t const * txn = it.rec;
+      if( FD_UNLIKELY( txn->completion_time_ns<start_ns || txn->completion_time_ns>end_ns ) ) continue;
+      if( FD_UNLIKELY( !txns ) ) {
+        txns = fd_alloc_malloc( gui->alloc, alignof(fd_gui_replay_txn_ptr_t), ptr_cnt*sizeof(fd_gui_replay_txn_ptr_t) );
+        if( FD_UNLIKELY( !txns ) ) {
+          fd_gui_hist_range_end( &it );
+          return -1;
+        }
+      }
+      txns[ txn_cnt++ ] = txn;
+      if( FD_UNLIKELY( txn_cnt>FD_GUI_TIMELINE_QUERY_TRANSACTION_MAX ) ) break;
+      fd_gui_replay_txn_min_ts( &reference_ts, txn );
+    }
+    fd_gui_hist_range_end( &it );
+  }
+
+  if( FD_UNLIKELY( txn_cnt>FD_GUI_TIMELINE_QUERY_TRANSACTION_MAX ) ) {
+    if( FD_LIKELY( txns ) ) fd_alloc_free( gui->alloc, txns );
+    fd_gui_printf_timeline_result_limit_exceeded( gui, topic, key, id );
+    return 0;
+  }
+
+  if( FD_LIKELY( txns ) ) fd_gui_replay_txn_ptr_sort_inplace( txns, txn_cnt );
+  ulong reference_slot = txn_cnt ? txns[ 0 ]->slot : ULONG_MAX;
+
+  jsonp_open_envelope( gui->http, topic, key );
+    jsonp_ulong( gui->http, "id", id );
+    jsonp_open_object( gui->http, "value" );
+      if( txn_cnt ) jsonp_ulong( gui->http, "reference_slot", reference_slot );
+      else          jsonp_null ( gui->http, "reference_slot" );
+      if( reference_ts!=LONG_MAX ) jsonp_long_as_str( gui->http, "reference_ts", reference_ts );
+      else                          jsonp_null       ( gui->http, "reference_ts" );
+
+#define TXN_ARRAY_ULONG(name,field) do {                         \
+  jsonp_open_array( gui->http, (name) );                         \
+  for( ulong i=0UL; i<txn_cnt; i++ )                            \
+    jsonp_ulong( gui->http, NULL, txns[ i ]->field );            \
+  jsonp_close_array( gui->http );                               \
+} while(0)
+
+#define TXN_ARRAY_ULONG_STR(name,field) do {                     \
+  jsonp_open_array( gui->http, (name) );                         \
+  for( ulong i=0UL; i<txn_cnt; i++ )                            \
+    jsonp_ulong_as_str( gui->http, NULL, txns[ i ]->field );     \
+  jsonp_close_array( gui->http );                               \
+} while(0)
+
+#define TXN_ARRAY_TS(name,field,nullable) do {                   \
+  jsonp_open_array( gui->http, (name) );                         \
+  for( ulong i=0UL; i<txn_cnt; i++ ) {                          \
+    if( (nullable) && txns[ i ]->field==LONG_MAX )              \
+      jsonp_null( gui->http, NULL );                             \
+    else                                                        \
+      jsonp_long_as_str( gui->http, NULL, txns[ i ]->field-reference_ts ); \
+  }                                                             \
+  jsonp_close_array( gui->http );                               \
+} while(0)
+
+#define TXN_ARRAY_BOOL(name,field) do {                          \
+  jsonp_open_array( gui->http, (name) );                         \
+  for( ulong i=0UL; i<txn_cnt; i++ )                            \
+    jsonp_bool( gui->http, NULL, txns[ i ]->field );             \
+  jsonp_close_array( gui->http );                               \
+} while(0)
+
+      jsonp_open_array( gui->http, "slot_delta" );
+        for( ulong i=0UL; i<txn_cnt; i++ ) jsonp_ulong( gui->http, NULL, txns[ i ]->slot-reference_slot );
+      jsonp_close_array( gui->http );
+      TXN_ARRAY_ULONG( "txn_idx",      txn_idx      );
+      TXN_ARRAY_ULONG( "txn_exec_idx", txn_exec_idx );
+
+      if( is_timestamps ) {
+        TXN_ARRAY_TS( "txn_sigverify_start_ts_delta", sigverify_start_ns, 0 );
+        TXN_ARRAY_TS( "txn_sigverify_end_ts_delta",   sigverify_end_ns,   0 );
+        TXN_ARRAY_TS( "txn_exec_start_ts_delta",      exec_start_ns,      0 );
+        TXN_ARRAY_TS( "txn_load_start_ts_delta",      load_start_ns,      0 );
+        TXN_ARRAY_TS( "txn_check_start_ts_delta",     check_start_ns,     1 );
+        TXN_ARRAY_TS( "txn_execute_start_ts_delta",   execute_start_ns,   1 );
+        TXN_ARRAY_TS( "txn_commit_start_ts_delta",    commit_start_ns,    1 );
+        TXN_ARRAY_TS( "txn_commit_end_ts_delta",      commit_end_ns,      0 );
+      } else {
+        jsonp_open_array( gui->http, "txn_signature" );
+          for( ulong i=0UL; i<txn_cnt; i++ ) {
+            FD_BASE58_ENCODE_64_BYTES( txns[ i ]->signature, signature_b58 );
+            jsonp_string( gui->http, NULL, signature_b58 );
+          }
+        jsonp_close_array( gui->http );
+        jsonp_open_array( gui->http, "txn_compute_units_requested" );
+          for( ulong i=0UL; i<txn_cnt; i++ ) {
+            if( txns[ i ]->compute_units_requested ) jsonp_ulong( gui->http, NULL, txns[ i ]->compute_units_requested );
+            else                                      jsonp_null ( gui->http, NULL );
+          }
+        jsonp_close_array( gui->http );
+        TXN_ARRAY_ULONG(     "txn_compute_units_consumed", compute_units_consumed );
+        TXN_ARRAY_ULONG_STR( "txn_transaction_fee",        transaction_fee         );
+        TXN_ARRAY_ULONG_STR( "txn_priority_fee",           priority_fee            );
+        TXN_ARRAY_ULONG_STR( "txn_tips",                   tips                    );
+        TXN_ARRAY_ULONG(     "txn_error_code",             error_code              );
+        TXN_ARRAY_BOOL(      "txn_is_committable",         is_committable          );
+        TXN_ARRAY_BOOL(      "txn_is_fees_only",           is_fees_only            );
+        TXN_ARRAY_BOOL(      "txn_is_simple_vote",         is_simple_vote          );
+      }
+
+#undef TXN_ARRAY_BOOL
+#undef TXN_ARRAY_TS
+#undef TXN_ARRAY_ULONG_STR
+#undef TXN_ARRAY_ULONG
+
+    jsonp_close_object( gui->http );
+  jsonp_close_envelope( gui->http );
+
+  if( FD_LIKELY( txns ) ) fd_alloc_free( gui->alloc, txns );
+  return 0;
 }
 
 void
@@ -3031,10 +3266,15 @@ fd_gui_printf_timeline_query_agg( fd_gui_t *   gui,
     jsonp_open_object( gui->http, "value" );
       jsonp_string     ( gui->http, "granularity", granularity );
       jsonp_long_as_str( gui->http, "reference_ts_ns", reference_ts_ns );
-      if( root_slot==ULONG_MAX ) jsonp_null ( gui->http, "root_slot" );
-      else                       jsonp_ulong( gui->http, "root_slot", root_slot );
+      if( strcmp( key, "query_agg_slots" ) ) {
+        if( root_slot==ULONG_MAX ) jsonp_null ( gui->http, "root_slot" );
+        else                       jsonp_ulong( gui->http, "root_slot", root_slot );
+      }
 
-      if( !strcmp( key, "query_agg_shreds" ) ) {
+      if( !strcmp( key, "query_agg_slots" ) ) {
+        TIMELINE_ARRAY( "start_slot", start_slot, 0 );
+        TIMELINE_ARRAY( "end_slot",   end_slot,   0 );
+      } else if( !strcmp( key, "query_agg_shreds" ) ) {
         TIMELINE_ARRAY( "shreds",        shreds,        0 );
         TIMELINE_ARRAY( "turbine",       turbine,       0 );
         TIMELINE_ARRAY( "repair",        repair,        0 );

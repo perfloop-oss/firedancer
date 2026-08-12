@@ -1227,6 +1227,8 @@ run_sched_rdisp_case( uchar const * data, ulong data_sz ) {
         ulong local = find_txn( block, txn );
         FD_TEST( local!=ULONG_MAX );
         FD_TEST( block->start_seen );
+        FD_TEST( info->slot==block->slot );
+        FD_TEST( info->index_in_slot==local );
         if( FD_LIKELY( task->task_type==FD_SCHED_TT_TXN_EXEC ) )
           FD_TEST( (block->exec_done_mask & block->pred_mask[ local ]) == block->pred_mask[ local ] );
         if( FD_LIKELY( task->task_type==FD_SCHED_TT_TXN_EXEC ) ) FD_TEST( !(info->flags & FD_SCHED_TXN_EXEC_DONE) );

@@ -1841,6 +1841,12 @@ once they are confirmed (the prior epoch has fully rooted).
     "end_time_nanos": "1719910299914232",
     "start_slot": 274752000,
     "end_slot": 275183999,
+    "epoch_schedule": {
+        "slots_per_epoch": 432000,
+        "first_normal_epoch": 0,
+        "first_normal_slot": 0,
+        "warmup": false
+    },
     "target_slot_duration_nanos": 400000000,
     "excluded_stake_lamports": "0",
     "staked_pubkeys": [
@@ -1876,11 +1882,41 @@ once they are confirmed (the prior epoch has fully rooted).
 | end_time_nanos | `string` | A UNIX timestamp, in nanoseconds, of when the epoch ended. This is the time the last non-skipped block of the epoch finished replaying locally on this validator, if the validator was online when that happened, otherwise it is null |
 | start_slot | `number` | The first slot (inclusive) in the epoch |
 | end_slot   | `number` | The last slot (inclusive) in the epoch |
+| epoch_schedule | `EpochScheduleConfig\|null` | The cluster's epoch schedule parameters, which can be used to map any slot to its epoch. Always `null` on Frankendancer |
 | target_slot_duration_nanos | `number` | The cluster-wide target slot duration, in nanoseconds, for the epoch. This is typically `400000000` (400ms) on most clusters unless a `reduce_slot_time` feature gate is in effect |
 | excluded_stake_lamports | `string` | Always zero. Firedancer tracks the complete validator-admission-ticket stake set.
 | staked_pubkeys | `string[]` | All validator identity keys in the validator-admission-ticket stake set for this epoch, capped at 2,000 entries |
 | staked_lamports | `string[]` | A list with the same length as the `staked_pubkeys` field. `stake_lamports[ i ]` is the number of lamports staked on the pubkey `staked_pubkeys[ i ]` as of this epoch
 | leader_slots | `number[]` | An array, one entry per four slots, of which pubkey in the `leader_pubkeys` array is leader for those slots. On `mainnet-beta` this array will always have a length of 108,000, which is the number of slots in an epoch divided by four.  Leader slots are in groups of four because the leader schedule is generated in such a way as to guarantee each leader gets at least four consecutive slots.  For example, to find the pubkey of the leader in slot 1000 of the epoch, it is `staked_pubkeys[ leader_slots[ 1000/4 ] ]` |
+
+**`EpochScheduleConfig`**
+| Field      | Type    | Description
+|------------|---------|------------
+| slots_per_epoch | `number` | The number of slots in every epoch at or after `first_normal_epoch` |
+| first_normal_epoch | `number` | The first epoch whose length is `slots_per_epoch` |
+| first_normal_slot | `number` | The first slot in `first_normal_epoch` |
+| warmup | `boolean` | Whether epochs before `first_normal_epoch` use the protocol's warmup schedule, starting at 32 slots and doubling in length each epoch |
+
+##### Mapping a slot to an epoch
+
+When `epoch_schedule` is not `null`, use the following exact integer
+formula for any non-negative integer `slot`. `floor_log2` is the floor
+of the base-2 logarithm and `div` is integer division.
+`MINIMUM_SLOTS_PER_EPOCH` is the Solana protocol constant `32`.
+
+```text
+if slot < first_normal_slot:
+    epoch = floor_log2(slot + MINIMUM_SLOTS_PER_EPOCH)
+          - floor_log2(MINIMUM_SLOTS_PER_EPOCH)
+else:
+    epoch = first_normal_epoch
+          + ((slot - first_normal_slot) div slots_per_epoch)
+```
+
+When `warmup` is false, `first_normal_epoch` and `first_normal_slot` are
+both zero, so every slot uses the second branch. When it is true, the
+first branch covers the shorter warmup epochs and the second covers all
+normal epochs.
 
 On establishing a connection two epochs are sent to the client. The
 current epoch that the cluster is in, and the next epoch. From then on,
@@ -2452,8 +2488,15 @@ Value is a flat array of base58-encoded identity pubkeys that have gone
 offline (activity timeout expired) since the last message.
 
 ### timeline
-Historical shred event data recorded by the validator, queryable over a
-UNIX nanosecond timestamp window.
+Historical event data recorded by the validator, queryable over a UNIX
+nanosecond timestamp window.
+
+All timeline queries accept the same parameters.
+
+| param       | type     | description |
+|-------------|----------|-------------|
+| start_ns    | `string` | Inclusive lower bound of the UNIX nanosecond timestamp window |
+| end_ns      | `string` | Inclusive upper bound of the UNIX nanosecond timestamp window |
 
 #### `timeline.query_shreds`
 | frequency   | type          | example |
@@ -2462,15 +2505,29 @@ UNIX nanosecond timestamp window.
 
 | param    | type     | description |
 |----------|----------|-------------|
-| start_ns | `string` | Inclusive lower bound of the UNIX nanosecond timestamp window to query for shred events |
-| end_ns   | `string` | Inclusive upper bound of the UNIX nanosecond timestamp window to query for shred events |
+| start_ns | `string` | Inclusive lower bound of the UNIX nanosecond timestamp window, encoded as a non-empty decimal string |
+| end_ns   | `string` | Inclusive upper bound of the UNIX nanosecond timestamp window, encoded as a non-empty decimal string |
 
 WebSocket clients may request historical shred metadata over a UNIX
-nanosecond timestamp window.  The requested window must not exceed 10
-seconds.  The response has the same shape as the live `slot.live_shreds`
-topic and covers every shred event recorded in the window across all
-slots.  If no shred events fall in the window, the response arrays will
-be empty.
+nanosecond timestamp window. The response has the same shape as the live
+`slot.live_shreds` topic and covers every shred event recorded in the
+window across all slots. If no shred events fall in the window, the
+response arrays will be empty.
+
+A response may contain at most 524,288 shred events. If the inclusive
+window contains more, the server returns no partial data and leaves the
+WebSocket connection open:
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_shreds",
+    "id": 32,
+    "error": {
+        "code": "result_limit_exceeded"
+    }
+}
+```
 
 ::: details Example
 
@@ -2504,6 +2561,176 @@ be empty.
 
 :::
 
+#### Transaction timeline queries
+
+The transaction timeline is split into two queries:
+
+| key                             | type                    | additional columns |
+|---------------------------------|-------------------------|--------------------|
+| `timeline.query_txn_timestamps` | `TimelineTxnTimestamps` | Transaction lifecycle timestamps |
+| `timeline.query_txn_meta`       | `TimelineTxnMeta`       | Transaction signature, cost, fees, and result metadata |
+
+A transaction is included when both execution and signature verification
+have completed and the later of those two completion timestamps is in
+the inclusive `[start_ns, end_ns]` window. Consequently, earlier phases
+of an included transaction may have occurred before `start_ns`.
+
+A response may contain at most 65,536 transactions. If the inclusive
+window contains more, the server returns no partial data and leaves the
+WebSocket connection open. The response key matches the requested query:
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_txn_timestamps",
+    "id": 34,
+    "error": {
+        "code": "result_limit_exceeded"
+    }
+}
+```
+
+Responses include work performed even on minority forks. They are column
+oriented and ordered by slot and then by `txn_idx`; element `i` in every
+array describes the same transaction. Both queries use these common fields:
+
+| Field          | Type           | Description |
+|----------------|----------------|-------------|
+| reference_slot | `number\|null` | The smallest slot number among the returned transactions, or `null` for an empty response |
+| reference_ts   | `string\|null` | The smallest UNIX nanosecond timestamp represented by any transaction phase in the response, or `null` for an empty response. This may be earlier than `start_ns` |
+| slot_delta     | `number[]`     | `reference_slot + slot_delta[i]` is the slot for transaction `i` |
+| txn_idx        | `number[]`     | Zero-based position of the transaction in its candidate block |
+| txn_exec_idx   | `number[]`     | Index of the replay execution tile which executed the transaction |
+
+If no transaction completed in the window, all arrays are empty and
+`reference_slot` and `reference_ts` are `null`. `txn_idx` values may have
+gaps because the time window can select only part of a slot. Responses
+assume at most one replay candidate for each slot.
+
+##### `timeline.query_txn_timestamps`
+
+::: details Example
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_txn_timestamps",
+    "id": 34,
+    "params": {
+        "start_ns": "1739657041588000000",
+        "end_ns": "1739657041589000000"
+    }
+}
+```
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_txn_timestamps",
+    "id": 34,
+    "value": {
+        "reference_slot": 289245044,
+        "reference_ts": "1739657041587920000",
+        "slot_delta": [0, 0, 1],
+        "txn_idx": [0, 1, 0],
+        "txn_exec_idx": [0, 1, 0],
+        "txn_sigverify_start_ts_delta": ["0", "10000", "20000"],
+        "txn_sigverify_end_ts_delta": ["160000", "220000", "300000"],
+        "txn_exec_start_ts_delta": ["20000", "40000", "60000"],
+        "txn_load_start_ts_delta": ["30000", "50000", "70000"],
+        "txn_check_start_ts_delta": ["50000", "80000", null],
+        "txn_execute_start_ts_delta": ["70000", "100000", null],
+        "txn_commit_start_ts_delta": ["110000", "150000", null],
+        "txn_commit_end_ts_delta": ["130000", "190000", "180000"]
+    }
+}
+```
+
+:::
+
+Signature verification and execution may proceed concurrently. Check,
+execute, and commit may be skipped, in which case the corresponding start
+timestamp is `null`.
+
+```text
++-- sigverify      --+
+^ sigverify_start  ^ sigverify_end
+
++-- load      --> check      --> execute      --> commit      --+
+^ load_start  ^ check_start  ^ execute_start  ^ commit_start  ^ commit_end
+```
+
+| Field                        | Type               | Description |
+|------------------------------|--------------------|-------------|
+| txn_sigverify_start_ts_delta | `string[]`         | Nanoseconds from `reference_ts` until replay dispatched signature verification |
+| txn_sigverify_end_ts_delta   | `string[]`         | Nanoseconds from `reference_ts` until replay received the signature-verification result |
+| txn_exec_start_ts_delta      | `string[]`         | Nanoseconds from `reference_ts` until replay started the transaction execution task |
+| txn_load_start_ts_delta      | `string[]`         | Nanoseconds from `reference_ts` until the runtime began loading and preparing transaction state |
+| txn_check_start_ts_delta     | `(string\|null)[]` | Nanoseconds from `reference_ts` until runtime validation checks began, or `null` if the transaction did not reach this phase |
+| txn_execute_start_ts_delta   | `(string\|null)[]` | Nanoseconds from `reference_ts` until instruction execution began, or `null` if the transaction did not reach this phase |
+| txn_commit_start_ts_delta    | `(string\|null)[]` | Nanoseconds from `reference_ts` until commit began, or `null` if the transaction was not committable |
+| txn_commit_end_ts_delta      | `string[]`         | Nanoseconds from `reference_ts` until commit or cancellation completed |
+
+##### `timeline.query_txn_meta`
+
+::: details Example
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_txn_meta",
+    "id": 35,
+    "params": {
+        "start_ns": "1739657041588000000",
+        "end_ns": "1739657041589000000"
+    }
+}
+```
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_txn_meta",
+    "id": 35,
+    "value": {
+        "reference_slot": 289245044,
+        "reference_ts": "1739657041587920000",
+        "slot_delta": [0, 0, 1],
+        "txn_idx": [0, 1, 0],
+        "txn_exec_idx": [0, 1, 0],
+        "txn_signature": [
+            "2BfWBnhTP1ZZwFZutwThj5VT1hX71X9otbgFr21W2XJfcppXakbPCvJ2eCh8eBcS74Lfjar5AuowuppAjsEceSuW",
+            "5Pj5fCupXLUePYn18JkryV6fVAM4GZ3h6zBGX7pA4f9xKp1F2Ww8V6StvD4xY9mQ3eB7nH2sR5cT8uJ1kL6aZabc",
+            "2BfWBnhTP1ZZwFZutwThj5VT1hX71X9otbgFr21W2XJfcppXakbPCvJ2eCh8eBcS74Lfjar5AuowuppAjsEceSuW"
+        ],
+        "txn_compute_units_requested": [3428, 210000, null],
+        "txn_compute_units_consumed": [3428, 15234, 0],
+        "txn_transaction_fee": ["5000", "5000", "0"],
+        "txn_priority_fee": ["0", "1200", "0"],
+        "txn_tips": ["0", "0", "0"],
+        "txn_error_code": [0, 9, 3],
+        "txn_is_committable": [true, true, false],
+        "txn_is_fees_only": [false, false, false],
+        "txn_is_simple_vote": [true, false, false]
+    }
+}
+```
+
+:::
+
+| Field                       | Type               | Description |
+|-----------------------------|--------------------|-------------|
+| txn_signature               | `string[]`         | Base58-encoded first signature of the transaction |
+| txn_compute_units_requested | `(number\|null)[]` | Strict upper bound on consensus compute cost requested by the transaction, with the same meaning as in `Transactions`, or `null` if no valid requested cost could be derived |
+| txn_compute_units_consumed  | `number[]`         | Post-execution consensus compute cost, with the same meaning as in `Transactions`. This is zero when the transaction was rejected before cost could be applied |
+| txn_transaction_fee         | `string[]`         | Runtime-calculated transaction fee in lamports for this transaction |
+| txn_priority_fee            | `string[]`         | Runtime-calculated priority fee in lamports for this transaction |
+| txn_tips                    | `string[]`         | Runtime-calculated tips in lamports for this transaction |
+| txn_error_code              | `number[]`         | Final replay error code. Uses the same error codes documented for `Transactions` below |
+| txn_is_committable          | `boolean[]`        | Whether the runtime determined the transaction could commit to this candidate. This does not mean the candidate became rooted |
+| txn_is_fees_only            | `boolean[]`        | Whether the committable transaction applies only fee or nonce changes without executing instructions |
+| txn_is_simple_vote          | `boolean[]`        | Whether the transaction is a simple vote transaction |
+
 #### Aggregate timeline queries
 
 The aggregate timeline queries provide compact views of rooted slot
@@ -2531,35 +2758,92 @@ Supported granularities are:
 Buckets are aligned to the UNIX epoch. For a granularity of `G`
 nanoseconds, the bucket containing timestamp `t` is the half-open
 interval `[floor(t/G)*G, floor(t/G)*G+G)`. A response includes every
-bucket from the bucket containing `start_ns` through the bucket containing
-`end_ns`. Because the query bounds are inclusive, an `end_ns` exactly on
-a bucket boundary includes the bucket beginning at `end_ns`. A query may
-intersect at most 150 buckets.
+bucket from the bucket containing `start_ns` through the bucket
+containing `end_ns`. Because the query bounds are inclusive, an `end_ns`
+exactly on a bucket boundary includes the bucket beginning at `end_ns`.
+A query may intersect at most 150 buckets.
 
 Query responses include only rooted slots as of the time the request is
-received. `root_slot` is the validator's rooted slot when the query begins,
-and the response includes only slots rooted through `root_slot`. A rooted,
-non-skipped slot contributes all of its values to the bucket containing its
-completion timestamp. Slots without a known completion timestamp do not
-contribute. In particular, shred counts are assigned to the slot's
-completion bucket even if the shreds were received, reconstructed, or
-published during an earlier bucket.
+received. For aggregate metric queries, `root_slot` is the validator's
+rooted slot when the query begins, and the response includes only slots
+rooted through `root_slot`. A rooted, non-skipped slot contributes all
+of its values to the bucket containing its completion timestamp. Skipped
+slots do not contribute to metric aggregates, with the exception of
+`timeline.query_agg_slots`.
 
 Responses use dense parallel arrays to minimize network bandwidth.
-`reference_ts_ns` is the UNIX nanosecond timestamp at the start of bucket
-zero. For a granularity of `G` nanoseconds, array element `i` represents
-the bucket beginning at `reference_ts_ns + i*G`. Every metric array in a
-response has one element for every returned bucket. The same query window
-and granularity therefore produce identical bucket indices across all
-aggregate queries. For an array of length `N`, the exclusive end of the
-response time range is `reference_ts_ns + N*G`.
+`reference_ts_ns` is the UNIX nanosecond timestamp at the start of
+bucket zero. For a granularity of `G` nanoseconds, array element `i`
+represents the bucket beginning at `reference_ts_ns + i*G`. Every metric
+array in a response has one element for every returned bucket. The same
+query window and granularity therefore produce identical bucket indices
+across all aggregate queries. For an array of length `N`, the exclusive
+end of the response time range is `reference_ts_ns + N*G`.
 
-The rightmost bucket can be partial because additional slots may root into
-it after the query begins. Separate queries can therefore return different
-values for that bucket if `root_slot` advances between requests.
+The rightmost bucket can be partial because additional slots may root
+into it after the query begins. Separate queries can therefore return
+different values for that bucket if `root_slot` advances between
+requests.
 
 When aggregating a field, null slot-level values are ignored. A bucket
 value is `null` if no represented slot has a known value for that field.
+
+#### `timeline.query_agg_slots`
+| frequency | type            | example |
+|-----------|-----------------|---------|
+| *Request* | `AggSlotsQuery` | below   |
+
+Returns the inclusive slot range assigned to each time bucket. This lets
+clients map buckets returned by other aggregate timeline queries to slots.
+
+| Field             | Type       | Description |
+|-------------------|------------|-------------|
+| granularity       | `string`   | Requested granularity |
+| reference_ts_ns   | `string`   | Start of bucket zero, in UNIX nanoseconds |
+| start_slot        | `(number\|null)[]` | Inclusive first slot assigned to bucket `i`, or `null` if the bucket is empty |
+| end_slot          | `(number\|null)[]` | Inclusive last slot assigned to bucket `i`, or `null` if the bucket is empty |
+
+`start_slot` and `end_slot` have one element for every
+returned bucket. A slot with a known completion timestamp is assigned to
+the bucket containing that timestamp. A slot is assigned to at most one
+bucket.
+
+Skipped slots do not have a completion timestamp. The server assigns them
+to a preceding or following bucket in slot order so that represented
+ranges remain continuous. For two adjacent non-empty buckets,
+`end_slot[i] + 1 == start_slot[i + 1]`. A bucket containing no assigned
+slots has `null` at index `i` in both `start_slot` and `end_slot`.
+
+::: details Example
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_agg_slots",
+    "id": 32,
+    "params": {
+        "start_ns": "1739657041000000000",
+        "end_ns": "1739657101000000000",
+        "granularity": "30s"
+    }
+}
+```
+
+```json
+{
+    "topic": "timeline",
+    "key": "query_agg_slots",
+    "id": 32,
+    "value": {
+        "granularity": "30s",
+        "reference_ts_ns": "1739657040000000000",
+        "start_slot": [289244901, 289244976, 289245051],
+        "end_slot": [289244975, 289245050, 289245125]
+    }
+}
+```
+
+:::
 
 #### `timeline.query_agg_shreds`
 | frequency | type             | example |

@@ -59,7 +59,8 @@ typedef struct fd_gui fd_gui_t;
 #define FD_GUI_HIST_TILE_STATS       (9)  /* (ts, type)            */
 #define FD_GUI_HIST_TXN_WATERFALL    (10) /* (ts, type)            */
 #define FD_GUI_HIST_TIMELINE_DAY     (11) /* (unix day)            */
-#define FD_GUI_HIST_CNT              (12)
+#define FD_GUI_HIST_REPLAY_TXN       (12) /* (completion ts, slot, txn) */
+#define FD_GUI_HIST_CNT              (13)
 
 struct fd_gui_hist_metrics {
   /* Writes that hit MAP_FULL and were dropped. */
