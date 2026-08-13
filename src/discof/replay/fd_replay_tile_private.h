@@ -7,6 +7,7 @@
 #include "../../disco/bundle/fd_bundle_crank.h"
 #include "../../disco/keyguard/fd_keyswitch.h"
 #include "../../disco/node_info/fd_node_info.h"
+#include "../../discof/poh/fd_poh.h"
 #include "../../discof/reasm/fd_reasm.h"
 #include "../../discof/replay/fd_sched.h"
 #include "../../flamenco/capture/fd_capture_ctx.h"
@@ -16,6 +17,7 @@
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/runtime/fd_txncache.h"
 #include "../../flamenco/runtime/tests/fd_dump_pb.h"
+#include "../../disco/events/generated/fd_event_gen.h"
 #include <stdio.h>
 
 struct fd_replay_in_link {
@@ -63,6 +65,34 @@ typedef struct fd_block_id_ele fd_block_id_ele_t;
 #define MAP_KEY_EQ(k0,k1)      (!memcmp((k0),(k1), sizeof(fd_hash_t)))
 #define MAP_KEY_HASH(key,seed) (fd_hash((seed),(key),sizeof(fd_hash_t)))
 #include "../../util/tmpl/fd_map_chain.c"
+
+/* Number of concurrently-capturable blocks for the block_completed event's
+   txn_timing[] array (see the timing_slot_* fields below). */
+
+#define FD_REPLAY_TXN_TIMING_SLOTS (16UL)
+
+/* The capture slots below (and poh's leader table) hold a full block's
+   worth of transactions, so the event's array has to be able to ship them
+   all; otherwise blocks would silently report fewer transactions than they
+   contain.  The event fills clamp to the array bound, so a mismatch
+   truncates rather than overruns, but truncation is invisible downstream.
+   The schema's max_len for txn_timing[] tracks FD_MAX_TXN_PER_SLOT. */
+
+FD_STATIC_ASSERT( FD_EVENT_BLOCK_COMPLETED_TXN_TIMING_MAX>=FD_MAX_TXN_PER_SLOT, txn_timing_ships_full_block );
+
+/* One transaction's lifecycle ticks (fd_tickcount() TSC values, except
+   received_ns which is already wallclock), copied out of the scheduler's
+   txn_info at txn completion, converted to wallclock at block completion. */
+
+struct fd_replay_txn_timing {
+  long received_ns;
+  long parsed;
+  long sigverify_disp;
+  long sigverify_done;
+  long exec_disp;
+  long exec_done;
+};
+typedef struct fd_replay_txn_timing fd_replay_txn_timing_t;
 
 struct fd_replay_tile {
   fd_wksp_t * wksp;
@@ -340,6 +370,28 @@ struct fd_replay_tile {
   long        reset_timestamp_nanos;
   fd_bank_t * leader_bank;
 
+  /* Per-leader-slot telemetry stash for the block_completed event.  Replay
+     is leader for at most one slot at a time (leader_bank), so a single
+     instance keyed by `slot` suffices.  L1 fields are captured when we
+     become leader; the pack/poh summary arrives later on the poh
+     slot-ended message; all are consumed in report_block_completed.
+     slot==ULONG_MAX means no leader stats pending. */
+  struct {
+    ulong slot;                       /* leader slot these stats describe; ULONG_MAX = none */
+    long  became_leader_nanos;        /* actual wallclock when we became leader */
+    long  leader_slot_start_nanos;    /* scheduled start of the leader slot (from next_leader_tickcount) */
+    long  first_fec_returned_nanos;   /* when our own first FEC set of the block came back through reasm */
+    ulong microblock_count;
+    ulong pack_block_cost;
+    ulong pack_vote_cost;
+    ulong pack_data_bytes;
+    ulong bundle_txn_count;
+    int   pack_end_reason;            /* FD_PACK_END_REASON_* */
+    long  pack_start_nanos;
+    long  pack_end_nanos;
+    ulong timing_table_idx;           /* shared txn timing table for the slot; ULONG_MAX = none */
+  } leader_stats;
+
   fd_pubkey_t      identity_pubkey[1];
   ulong            identity_idx;
   int              identity_dirty;
@@ -419,6 +471,32 @@ struct fd_replay_tile {
 
   ulong                runtime_stack_seed;
   fd_runtime_stack_t * runtime_stack;
+
+  /* Staging buffer for the block_completed telemetry event.  The struct
+     is multiple MiB (protocol-max array bounds), so it cannot live on the
+     stack; it is allocated once in scratch and reused per block.  Always
+     allocated (to keep the scratch layout fixed) but only written when an
+     event link is wired (telemetry on). */
+  fd_event_block_completed_t * block_completed_event;
+
+  /* Per-txn lifecycle timing capture for the block_completed event's
+     txn_timing[] array.  The scheduler's txn_info_pool entries are recycled
+     the moment a txn completes, so the ticks are copied out at completion
+     time into a leased capture slot, indexed by the txn's position in the
+     block.  A full-depth buffer per live bank would be ~9.6 GiB, but only a
+     handful of blocks replay concurrently, so a small pool of full-depth
+     slots is leased to banks as they start replaying.  A block that cannot
+     get a slot (more than FD_REPLAY_TXN_TIMING_SLOTS blocks replaying at
+     once) reports an empty txn_timing[]. */
+  ulong                    timing_slot_bank[ FD_REPLAY_TXN_TIMING_SLOTS ]; /* leasing bank_idx, ULONG_MAX free */
+  ulong                    timing_slot_cnt [ FD_REPLAY_TXN_TIMING_SLOTS ]; /* captured txn high-watermark */
+  fd_replay_txn_timing_t * timing_slots    [ FD_REPLAY_TXN_TIMING_SLOTS ]; /* FD_MAX_TXN_PER_SLOT entries each */
+  ulong *                  timing_slot_of_bank; /* [max_live_slots] bank_idx -> slot idx or ULONG_MAX */
+
+  /* Shared per-txn timing tables for leader blocks, written by poh in mix
+     order (see fd_leader_txn_timing_table_t); NULL when not a leader
+     topology.  Read-only here. */
+  fd_leader_txn_timing_table_t const * leader_txn_timing;
 };
 
 typedef struct fd_replay_tile fd_replay_tile_t;

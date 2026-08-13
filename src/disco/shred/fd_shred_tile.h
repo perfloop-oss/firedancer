@@ -86,6 +86,51 @@ struct fd_fec_complete {
   fd_hash_t  merkle_root;    /* placed first to match format of shred base */
   fd_shred_t last_shred_hdr; /* header of last data shred in the FEC set */
   fd_hash_t  chained_merkle_root;
+
+  /* Block-level telemetry snapshot, filled in by the repair tile (which
+     owns the forest) when it forwards the FEC-complete to replay; see
+     fd_repair_tile.c after_fec().  The shred tile emits this message too
+     (on its own shred_out link, ahead of repair), but it has no forest:
+     it zeroes only stats_valid and fec_completed_ts_nanos, leaving the
+     blk_* fields uninitialized.  Repair fills the stats when its forest
+     still tracks the block and leaves stats_valid==0 otherwise, so
+     consumers must not read blk_* unless stats_valid==1.
+
+     These are a snapshot of the whole block's forest counters as of this
+     FEC.  They grow as shreds arrive, so they are only final (and read by
+     replay) on the slot-complete FEC.  Per-FEC data replay needs comes
+     from its own reasm stash, not from here. */
+  uint  stats_valid;             /* 1 if the repair tile filled the stats below */
+  uint  blk_turbine_cnt;         /* block: shreds received via turbine */
+  uint  blk_repair_cnt;          /* block: data shreds received via repair */
+  uint  blk_recovered_cnt;       /* block: shreds recovered via reed-solomon */
+  uint  blk_data_cnt;            /* block: data shreds received so far (== complete_idx+1 at slot complete) */
+  uint  blk_parity_cnt;          /* block: coding (parity) shreds received so far */
+  uint  blk_lowest_verified_fec; /* block: lowest verified FEC index, UINT_MAX if none */
+  uchar blk_chain_confirmed;     /* block: 1 if the whole chain has been merkle-verified */
+  uchar blk_slot_complete;       /* block: 1 if the slot-complete shred has been received */
+
+  /* Per-slot repair request/response tallies (forest req_*_cnt / response_cnt). */
+  uint  blk_req_window_cnt;      /* block: window (specific-shred) repair requests sent */
+  uint  blk_req_highest_cnt;     /* block: highest-window repair requests sent */
+  uint  blk_req_orphan_cnt;      /* block: orphan repair requests sent */
+  uint  blk_req_retransmit_cnt;  /* block: repair requests re-sent after a response timeout */
+  uint  blk_repair_responses;    /* block: repair responses received */
+  uchar blk_chain_verify_failed; /* block: 1 if merkle chain verification flagged this block bad */
+
+  /* When the shred completing this FEC set arrived from the network
+     (wallclock nanoseconds, converted by the repair tile from the shred
+     tile's arrival stamp; for recovered FEC sets, the arrival of the
+     shred that triggered recovery).  0 if unavailable.  Unlike the blk_*
+     stats above this is per-FEC and meaningful on every FEC-complete. */
+  ulong fec_completed_ts_nanos;
+
+  /* Per-slot timestamps, converted from the forest's fd_tickcount() values
+     to wallclock nanoseconds (unix epoch) by the repair tile.  0 if unset. */
+  ulong blk_first_shred_ts_nanos;   /* when the first shred of the slot arrived */
+  ulong blk_last_shred_ts_nanos;    /* when the slot became fully buffered */
+  ulong blk_first_req_ts_nanos;     /* when the first repair request for the slot was sent */
+  ulong blk_last_repair_resp_ts_nanos; /* when the most recent repair response for the slot arrived */
 };
 typedef struct fd_fec_complete fd_fec_complete_t;
 

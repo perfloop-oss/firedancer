@@ -139,6 +139,46 @@ enum RuntimeTxnExecErrKind {
   RUNTIME_TXN_EXEC_ERR_KIND_INSTR = 4;  // Instruction error
 }
 
+// Why the block was ruled invalid; not_dead otherwise. Blocks this validator produced are never dead: they do not go through replay's block checks.
+enum BlockCompletedDeadReason {
+  BLOCK_COMPLETED_DEAD_REASON_UNSPECIFIED = 0;
+  BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD = 1;  // Not ruled invalid.
+  BLOCK_COMPLETED_DEAD_REASON_PARENT_DEAD = 2;  // The parent block was dead; the block cannot be replayed.
+  BLOCK_COMPLETED_DEAD_REASON_BAD_BLOCK_PARSE = 3;  // Contents did not parse into valid transactions.
+  BLOCK_COMPLETED_DEAD_REASON_BAD_BLOCK_TOO_MANY_TXNS = 4;  // More transactions than a valid block can hold.
+  BLOCK_COMPLETED_DEAD_REASON_TRAILING_ENTRY = 5;  // Block did not end on a tick; a transaction entry trailed the final tick.
+  BLOCK_COMPLETED_DEAD_REASON_TOO_FEW_TICKS = 6;  // Fewer ticks than required.
+  BLOCK_COMPLETED_DEAD_REASON_TOO_MANY_TICKS = 7;  // More ticks than allowed.
+  BLOCK_COMPLETED_DEAD_REASON_INVALID_TICK_HASH_COUNT = 8;  // Ticks did not contain the expected number of hashes.
+  BLOCK_COMPLETED_DEAD_REASON_POH_HASH_MISMATCH = 9;  // Proof-of-history hash did not verify.
+  BLOCK_COMPLETED_DEAD_REASON_SIGVERIFY_FAILED = 10;  // A transaction failed signature verification.
+  BLOCK_COMPLETED_DEAD_REASON_TXN_FAILED_TO_LOAD = 11;  // A transaction could not be prepared for execution (e.g. account or fee load failure).
+  BLOCK_COMPLETED_DEAD_REASON_BLOCK_COST_LIMIT = 12;  // A transaction pushed the block over its compute limit.
+  BLOCK_COMPLETED_DEAD_REASON_ACCOUNT_COST_LIMIT = 13;  // A transaction pushed one account over its per-block compute limit.
+  BLOCK_COMPLETED_DEAD_REASON_VOTE_COST_LIMIT = 14;  // A vote transaction pushed the block over its vote compute limit.
+  BLOCK_COMPLETED_DEAD_REASON_ACCOUNT_DATA_LIMIT = 15;  // A transaction pushed the block over its account data size limit.
+  BLOCK_COMPLETED_DEAD_REASON_DUPLICATE_ACCOUNT = 16;  // A transaction referenced the same account more than once.
+}
+
+// Why replay stopped before the block completed; not_abandoned otherwise. Independent of dead. Only replayed blocks can be abandoned; blocks this validator produced always complete.
+enum BlockCompletedAbandonedReason {
+  BLOCK_COMPLETED_ABANDONED_REASON_UNSPECIFIED = 0;
+  BLOCK_COMPLETED_ABANDONED_REASON_NOT_ABANDONED = 1;  // Not abandoned; the block completed or was ruled invalid.
+  BLOCK_COMPLETED_ABANDONED_REASON_PRUNED = 2;  // A block on another fork was rooted, discarding this fork before replay finished.
+  BLOCK_COMPLETED_ABANDONED_REASON_EVICTED = 3;  // Dropped for lack of room to track in-progress blocks. May be replayed later, producing a second, completed row.
+}
+
+// Why block production stopped; not_leader for blocks this validator did not produce.
+enum BlockCompletedPackEndReason {
+  BLOCK_COMPLETED_PACK_END_REASON_UNSPECIFIED = 0;
+  BLOCK_COMPLETED_PACK_END_REASON_NOT_LEADER = 1;  // Not produced by this validator.
+  BLOCK_COMPLETED_PACK_END_REASON_TIME = 2;  // The leader slot's time window ended.
+  BLOCK_COMPLETED_PACK_END_REASON_CU_LIMIT = 3;  // Compute unit limit reached.
+  BLOCK_COMPLETED_PACK_END_REASON_DATA_LIMIT = 4;  // Size (data bytes) limit reached.
+  BLOCK_COMPLETED_PACK_END_REASON_MICROBLOCK_LIMIT = 5;  // Microblock count limit reached.
+  BLOCK_COMPLETED_PACK_END_REASON_LEADER_SWITCH = 6;  // Leadership moved on, possibly before any microblock was packed.
+}
+
 // Slot that was voted on
 message SignedVoteTower {
   // Slot being voted on / locked out for
@@ -173,6 +213,24 @@ message RuntimeTxnAccountDiffs {
   bool is_new_vote = 11;
   // True if this write removed a vote account
   bool is_rm_vote = 12;
+}
+
+// Timestamps for one transaction. A zero timestamp means the stage did not occur on this path or was never reached.
+message BlockCompletedTxnTiming {
+  // Earliest time attributable to the transaction. Replayed blocks: network arrival of the shred completing the FEC set carrying the transaction; gap to parsed_time is the internal latency to parse. Leader blocks: entry into this validator — TPU network arrival, block engine receipt (bundles), gossip receipt (votes), or creation time (self-originated).
+  uint64 received_time = 1;
+  // Replayed blocks: when the scheduler handed the transaction to an execution tile. Leader blocks: when an execution tile began executing it; transactions of one bundle share the stamp.
+  uint64 dispatched_time = 2;
+  // When execution finished and results were committed to the block's state, on whichever path executed it.
+  uint64 replayed_time = 3;
+  // When the scheduler parsed the transaction out of received data, including address lookup table resolution. Gap from received_time covers the pipeline hop, in-order delivery waits, and parse position within the FEC set. 0 for leader blocks.
+  uint64 parsed_time = 4;
+  // When the scheduler dispatched signature verification, which runs in parallel with execution. 0 for leader blocks (verified upstream of pack).
+  uint64 sigverify_dispatched_time = 5;
+  // When the signature verification result returned to the scheduler. 0 for leader blocks.
+  uint64 sigverify_done_time = 6;
+  // When the transaction was mixed into the PoH stream, fixing its position in the block; transactions of one microblock share the stamp. 0 for blocks this validator did not produce.
+  uint64 poh_mixed_time = 7;
 }
 
 // The validator received a verified, deduplicated transaction
@@ -233,7 +291,7 @@ message SignedVote {
 
 // A slot reached a commitment level. Emitted once per slot per level reached. Join to block_completed on bank_seq, or on slot and block_id.
 message SlotConfirmed {
-  // Monotonic sequence number identifying this block within the current run; the join key to block_completed. Restarts at 1 each time a snapshot is loaded, so pair it with the stream's boot id. 0 means unavailable, which happens for forward confirmations where the block has not been replayed.
+  // Monotonic sequence number identifying this block within the current run; the join key to block_completed. Restarts at 1 each time a snapshot is loaded, so pair it with the stream's boot id. 0 means unavailable, which happens for forward confirmations where the block has not been replayed. The boot (snapshot or genesis) bank's confirmations carry bank_seq 1 but join to no block_completed row, since the boot block is not replayed.
   uint64 bank_seq = 1;
   // The slot being confirmed.
   uint64 slot = 2;
@@ -413,6 +471,126 @@ message RuntimeTxn {
   repeated bytes program_ids = 41;
 }
 
+// A block finished production, or replay on this validator, or was marked dead, or was abandoned before completing. On-chain data is deliberately not part of this event.
+message BlockCompleted {
+  // Bank sequence number, counting from 1 within a run; the join key to confirmation events. Not meaningful across restarts. 0 means no bank was ever allocated (block dropped as the child of a dead parent), leaving nothing to join on bank_seq; any forward confirmations for such a block join on slot and block_id. The boot bank (bank_seq 1) emits confirmation events but no block_completed row.
+  uint64 bank_seq = 1;
+  // Slot number of the block.
+  uint64 slot = 2;
+  // Epoch containing the slot.
+  uint64 epoch = 3;
+  // Slot number of the parent block. 0 if the parent was no longer locally known when the row was emitted.
+  uint64 parent_slot = 4;
+  // Finalized root slot when the row was emitted.
+  uint64 root_slot = 5;
+  // Lowest slot still held in memory when the row was emitted.
+  uint64 storage_slot = 6;
+  // Block identifier. For blocks that never completed reception (dead or abandoned early): the merkle root of the latest piece received.
+  bytes block_id = 7;
+  // Bank hash computed by replaying the block; the state commitment consensus votes on. Rows sharing slot and block_id but differing here indicate state divergence. 0 if the block never froze (dead or abandoned).
+  bytes bank_hash = 8;
+  // Whether the block was ruled invalid. Blocks merely given up on are not dead; see abandoned_reason. State accumulated before the ruling is still reported, so execution fields may be partially filled.
+  bool dead = 9;
+  // Why the block was ruled invalid; not_dead otherwise. Blocks this validator produced are never dead: they do not go through replay's block checks.
+  BlockCompletedDeadReason dead_reason = 10;
+  // When the block was ruled invalid; 0 if not dead.
+  uint64 dead_time = 11;
+  // Whether replay stopped before the block completed. Independent of dead: an abandoned block was not invalid. Equivalent to abandoned_reason != not_abandoned. State accumulated before abandonment is still reported, so execution fields may be partially filled.
+  bool abandoned = 12;
+  // Why replay stopped before the block completed; not_abandoned otherwise. Independent of dead. Only replayed blocks can be abandoned; blocks this validator produced always complete.
+  BlockCompletedAbandonedReason abandoned_reason = 13;
+  // When the block was abandoned; 0 if not abandoned.
+  uint64 abandoned_time = 14;
+  // Whether this validator produced the block as leader.
+  bool is_leader = 15;
+  // Network arrival at the shred tile of the block's first shred, stamped before signature verification. Leader blocks: when the first entry batch reached the shredding stage, before any network send. 0 if repair pruned the block before completion.
+  uint64 first_shred_received_time = 16;
+  // Network arrival of the shred that made the block contiguous; not necessarily the highest-numbered shred. Minus first_shred_received_time: reception duration. Leader blocks: when the final entry batch reached the shredding stage. 0 if repair pruned the block before completion.
+  uint64 last_shred_received_time = 17;
+  // First repair request for a specific missing shred (window request); highest-shred and orphan requests do not stamp this, so it can be 0 while their request counts are not. 0 if no window request was sent or repair pruned the block; always 0 for leader blocks.
+  uint64 first_repair_request_time = 18;
+  // Arrival of the last repair response matched to an outstanding specific-shred request; shreds from highest-shred and orphan responses do not stamp this. 0 if none was matched or repair pruned the block; always 0 for leader blocks.
+  uint64 last_repair_received_time = 19;
+  // When the block's first complete FEC set reached replay, after verification and reassembly. Minus first_shred_received_time: internal pipeline latency from network to replay. Leader blocks: when the block's own first FEC set returned to replay through reassembly; follows rather than precedes preparation_begin_time, since production shreds the block as it goes. 0 if no bank was ever allocated.
+  uint64 first_fec_set_received_time = 20;
+  // When replay began setting up the block's execution state: cloning from the parent and applying start-of-block updates (epoch boundary processing, fee and rent state). Follows first_fec_set_received_time. Gap to first_transaction_scheduled_time: setup cost, which for leader blocks includes waiting for pack to schedule the first transaction. 0 if the block was dropped before setup.
+  uint64 preparation_begin_time = 21;
+  // When replay dispatched the block's first transaction to an execution tile. Leader blocks: when an execution tile began the first packed transaction. Execution runs from here to last_transaction_finished_time; equal to it if the block executed no transactions or, for leader blocks, if production timing was unavailable (see txn_timing).
+  uint64 first_transaction_scheduled_time = 22;
+  // When the final transaction's execution result returned to replay and end-of-block processing began. Leader blocks: when the block was fully produced (final PoH hash received, block id returned through reassembly), trailing the last execution result by the PoH tail and final-entry shredding, most when a limit ended the block early. 0 if the block never finished executing (dead or abandoned).
+  uint64 last_transaction_finished_time = 23;
+  // When end-of-block processing finished and the block froze: state hashing complete, no further changes. Minus last_transaction_finished_time: finalization cost. 0 if the block never completed (dead or abandoned).
+  uint64 block_completed_time = 24;
+  // The parent's block_completed_time, denormalized to avoid a self-join. 0 if the parent's completion was never observed: parent untracked, parent never froze (dead or abandoned lineage), or the block chains directly off the snapshot or genesis boot bank.
+  uint64 parent_block_completed_time = 25;
+  // Number of FEC sets in the block; for blocks that never completed reception, the number received when the row was emitted. 0 if reassembly no longer tracked the block when the row was emitted.
+  uint64 fec_set_count = 26;
+  // Data shreds received or recovered. Leader blocks: shreds produced. 0 if repair pruned the block before completion.
+  uint32 data_shred_count = 27;
+  // Parity (recovery) shreds received. 0 if repair pruned the block before completion.
+  uint32 parity_shred_count = 28;
+  // Shreds received over the network via turbine. Near 0 for leader blocks. 0 if repair pruned the block before completion.
+  uint32 turbine_shred_count = 29;
+  // Shreds obtained from peers via repair. Always 0 for leader blocks. 0 if repair pruned the block before completion.
+  uint32 repair_shred_count = 30;
+  // Shreds reconstructed locally from parity data. Always 0 for leader blocks, which produce rather than recover their shreds. 0 if repair pruned the block before completion.
+  uint32 recovered_shred_count = 31;
+  // Whether every FEC set was verified to chain back to the confirmed block identity, i.e. the assembled data matches the block the cluster confirmed. Verification is confirmation-triggered and the value is snapshotted at the block's last received FEC set, so false means it had not run by then, not that it failed; at the live tip confirmation usually arrives later. True mainly when confirmation precedes reception completing, e.g. during catch-up. See lowest_verified_fec_index.
+  bool chain_confirmed = 32;
+  // Lowest FEC set index reached by chain verification as of the block's last received FEC set; the walk anchors at the confirmed block identity and works backwards. 0 means the whole block verified. 4294967295 means no verification information (verification never ran, or repair pruned the block); not a FEC index.
+  uint32 lowest_verified_fec_index = 33;
+  // Whether the shred marking the block complete was received. False if repair pruned the block before completion.
+  bool slot_complete_flag = 34;
+  // Whether conflicting shreds were detected for the slot.
+  bool equivocation_detected_shred = 35;
+  // Repair requests re-sent after a response timeout. Always 0 for leader blocks. 0 if repair pruned the block before completion.
+  uint32 repair_requests_retransmitted = 36;
+  // Repair responses matched to an outstanding specific-shred request. Shreds delivered by highest-shred and orphan responses count in repair_shred_count but are not matched here, so this can be 0 while repair_shred_count is not. Always 0 for leader blocks. 0 if repair pruned the block before completion.
+  uint32 repair_responses_received = 37;
+  // Repair requests for one specific missing shred, by index. Always 0 for leader blocks. 0 if repair pruned the block before completion.
+  uint32 repair_request_window_count = 38;
+  // Repair requests for the highest-numbered shred a peer holds, used to learn the block's length. Always 0 for leader blocks. 0 if repair pruned the block before completion.
+  uint32 repair_request_highest_window_count = 39;
+  // Repair requests for the block's ancestry when its parent is unknown; a response carries shreds from up to 11 ancestor blocks. Always 0 for leader blocks. 0 if repair pruned the block before completion.
+  uint32 repair_request_orphan_count = 40;
+  // Whether chain verification against the confirmed block identity found a mismatched (wrong-version) FEC held for this block; the piece was cleared and re-repaired, but may have arrived by any route, turbine included. Always false for leader blocks. False if repair pruned the block before completion.
+  bool repair_failed_chain_verify = 41;
+  // Compute units used by all transactions, votes included. Before remove_simple_vote_from_cost_model activates, non-vote usage is this minus cost_tracker_vote_cost; afterward the split is not derivable from this event. 0 if no cost tracker existed for the block (never prepared for replay, or no bank).
+  uint64 cost_tracker_block_cost = 42;
+  // Compute units used by vote transactions. Reads 0 once the remove_simple_vote_from_cost_model feature activates, which folds votes into the general costing. Also 0 if no cost tracker existed for the block.
+  uint64 cost_tracker_vote_cost = 43;
+  // New account data allocated, in bytes. 0 if no cost tracker existed for the block.
+  uint64 cost_tracker_allocated_accounts_data_size = 44;
+  // Block compute unit limit. 0 if no cost tracker existed for the block (never prepared for replay, or no bank).
+  uint64 cost_tracker_block_cost_limit = 45;
+  // Block vote compute unit limit. 0 if no cost tracker existed for the block.
+  uint64 cost_tracker_vote_cost_limit = 46;
+  // Per-account compute unit limit. 0 if no cost tracker existed for the block.
+  uint64 cost_tracker_account_cost_limit = 47;
+  // When replay began block production for the slot, all prerequisites (e.g. parent block identity) in hand. Minus leader_slot_start_time: local production start delay. 0 for blocks this validator did not produce.
+  uint64 became_leader_time = 48;
+  // When the leader slot was scheduled to begin, estimated locally by projecting slot durations from the reset onto the parent fork; embeds upstream lateness rather than tracking a cluster-absolute timeline. 0 for blocks this validator did not produce.
+  uint64 leader_slot_start_time = 49;
+  // When block production began. 0 for blocks this validator did not produce.
+  uint64 pack_start_time = 50;
+  // When block production ended. 0 for blocks this validator did not produce.
+  uint64 pack_end_time = 51;
+  // Microblocks pack scheduled during production. A microblock whose transactions all failed execution is skipped at PoH mixin and absent from the block, so this can exceed block content. 0 for blocks this validator did not produce.
+  uint64 microblock_count = 52;
+  // Compute units pack reserved while building the block, votes included. Reservations are refunded as transactions finish, so this can exceed cost_tracker_block_cost (the charged amount) by refunds unsettled at slot end. 0 for blocks this validator did not produce.
+  uint64 pack_block_cost = 53;
+  // Vote compute units pack reserved while building the block; can exceed cost_tracker_vote_cost by refunds unsettled at slot end. Pack's vote costing is not feature-gated, so this stays populated after remove_simple_vote_from_cost_model zeroes cost_tracker_vote_cost. 0 for blocks this validator did not produce.
+  uint64 pack_vote_cost = 54;
+  // Bytes pack's cost model reserved for block content: transaction payloads plus a 48-byte header per microblock, net of rebates settled by slot end. Excludes tick entries; can exceed the block's actual content by rebates unsettled at slot end. A size, not a compute measure. 0 for blocks this validator did not produce.
+  uint64 pack_data_bytes = 55;
+  // Why block production stopped; not_leader for blocks this validator did not produce.
+  BlockCompletedPackEndReason pack_end_reason = 56;
+  // Bundled transactions pack scheduled during production, counted whether or not the bundle survived to the block (aborted bundles are skipped at PoH mixin). 0 for blocks this validator did not produce.
+  uint64 bundle_txn_count = 57;
+  // Per-transaction timestamps, one entry per transaction in block order. Replayed blocks: stamped by the replay scheduler. Leader blocks: stamped by the production pipeline. Columns exclusive to the other path are 0. Always empty on dead or abandoned rows; otherwise best-effort: empty when no capture slot was free (more than 16 blocks replaying at once) or the production timing table was unavailable. Empty does not mean the block had no transactions.
+  repeated BlockCompletedTxnTiming txn_timing = 58;
+}
+
 // Combined event type
 message Event {
   oneof event {
@@ -424,5 +602,6 @@ message Event {
     AccdbPartitionAdded accdb_partition_added = 6;
     BlockEquivocated block_equivocated = 7;
     RuntimeTxn runtime_txn = 8;
+    BlockCompleted block_completed = 9;
   }
 }

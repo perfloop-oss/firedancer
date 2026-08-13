@@ -1086,8 +1086,10 @@ fd_banks_new_bank( fd_banks_t * banks,
   }
 
   child_bank->first_fec_set_received_nanos      = now;
+  child_bank->preparation_begin_nanos           = 0L;
   child_bank->first_transaction_scheduled_nanos = 0L;
   child_bank->last_transaction_finished_nanos   = 0L;
+  child_bank->block_completed_nanos             = 0L; /* pool element may be recycled */
 
   return child_bank;
 }
@@ -1100,6 +1102,9 @@ fd_banks_subtree_mark_dead( fd_banks_t * banks,
                             fd_bank_t *  bank,
                             ulong *      opt_idxs ) {
   if( FD_UNLIKELY( !bank ) ) FD_LOG_CRIT(( "invariant violation: bank is NULL" ));
+
+  /* An already-dead subtree was fully marked (and reported) before. */
+  if( FD_UNLIKELY( bank->state==FD_BANK_STATE_DEAD ) ) return 0UL;
 
   ulong idxs_cnt = 0UL;
   if( FD_UNLIKELY( bank->state==FD_BANK_STATE_PRUNABLE ) ) {
@@ -1123,7 +1128,7 @@ fd_banks_subtree_mark_dead( fd_banks_t * banks,
   return idxs_cnt;
 }
 
-void
+ulong
 fd_banks_mark_bank_dead( fd_banks_t * banks,
                          ulong        bank_idx,
                          ulong *      opt_idxs,
@@ -1131,8 +1136,14 @@ fd_banks_mark_bank_dead( fd_banks_t * banks,
   fd_bank_t * bank_pool = fd_banks_get_bank_pool( banks );
   fd_bank_t * bank      = fd_banks_pool_ele( bank_pool, bank_idx );
 
+  ulong prunable_before = banks->prunable_idx;
   ulong idxs_cnt = fd_banks_subtree_mark_dead( banks, bank_pool, bank, opt_idxs );
   if( opt_idxs_cnt ) *opt_idxs_cnt = idxs_cnt;
+
+  /* prunable_idx is a single victim; the walk clears it iff it converted
+     the PRUNABLE bank inside this subtree. */
+  return banks->prunable_idx==fd_banks_pool_idx_null( bank_pool ) ? prunable_before
+                                                                  : fd_banks_pool_idx_null( bank_pool );
 }
 
 static int

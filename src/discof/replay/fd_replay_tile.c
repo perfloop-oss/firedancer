@@ -45,6 +45,7 @@
 #include "../../flamenco/runtime/program/vote/fd_vote_state_versioned.h"
 #include "../../flamenco/runtime/program/vote/fd_vote_codec.h"
 #include "../../flamenco/runtime/tests/fd_dump_pb.h"
+#include "../../disco/events/fd_event_report.h"
 
 /* Replay concepts:
 
@@ -129,6 +130,9 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, fd_vote_tracker_align(),      fd_vote_tracker_footprint() );
   l = FD_LAYOUT_APPEND( l, fd_capture_ctx_align(),       fd_capture_ctx_footprint() );
   l = FD_LAYOUT_APPEND( l, alignof(fd_dump_proto_ctx_t), sizeof(fd_dump_proto_ctx_t) );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_event_block_completed_t), sizeof(fd_event_block_completed_t) );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_replay_txn_timing_t), FD_REPLAY_TXN_TIMING_SLOTS*FD_MAX_TXN_PER_SLOT*sizeof(fd_replay_txn_timing_t) );
+  l = FD_LAYOUT_APPEND( l, alignof(ulong),                tile->replay.max_live_slots*sizeof(ulong) );
 
   if( FD_UNLIKELY( tile->replay.dump_block_to_pb ) ) {
     l = FD_LAYOUT_APPEND( l, fd_block_dump_context_align(), fd_block_dump_context_footprint() );
@@ -242,6 +246,21 @@ publish_epoch_info( fd_replay_tile_t *  ctx,
 /* Transaction execution state machine helpers                        */
 /**********************************************************************/
 
+/* timing_slot_release returns a bank's leased txn timing capture slot (if
+   any) to the pool.  Called whenever a block stops being replayable:
+   completion, death, or eviction. */
+
+static inline void
+timing_slot_release( fd_replay_tile_t * ctx,
+                     ulong              bank_idx ) {
+  ulong tslot = ctx->timing_slot_of_bank[ bank_idx ];
+  if( FD_LIKELY( tslot!=ULONG_MAX ) ) {
+    ctx->timing_slot_bank[ tslot ]       = ULONG_MAX;
+    ctx->timing_slot_cnt [ tslot ]       = 0UL;
+    ctx->timing_slot_of_bank[ bank_idx ] = ULONG_MAX;
+  }
+}
+
 static void
 replay_block_start( fd_replay_tile_t * ctx,
                     ulong              bank_idx,
@@ -254,6 +273,20 @@ replay_block_start( fd_replay_tile_t * ctx,
   FD_CHECK_CRIT( bank->state==FD_BANK_STATE_INIT, "invariant violation: bank is not in correct state" );
 
   bank->preparation_begin_nanos = before;
+
+  /* Lease a txn timing capture slot for the block, if one is free.  If
+     not (more than FD_REPLAY_TXN_TIMING_SLOTS blocks replaying at once),
+     the block reports an empty txn_timing[].  Release any stale lease the
+     bank_idx may still hold (bank pool index reuse). */
+  timing_slot_release( ctx, bank_idx );
+  for( ulong i=0UL; i<FD_REPLAY_TXN_TIMING_SLOTS; i++ ) {
+    if( FD_LIKELY( ctx->timing_slot_bank[ i ]==ULONG_MAX ) ) {
+      ctx->timing_slot_bank[ i ] = bank_idx;
+      ctx->timing_slot_cnt [ i ] = 0UL;
+      ctx->timing_slot_of_bank[ bank_idx ] = i;
+      break;
+    }
+  }
 
   fd_bank_t * parent_bank = fd_banks_bank_query( ctx->banks, parent_bank_idx );
   FD_CHECK_CRIT( parent_bank, "invariant violation: parent bank is NULL" );
@@ -311,6 +344,352 @@ cost_tracker_snap( fd_bank_t * bank, fd_replay_slot_completed_t * slot_info ) {
   } else {
     memset( &slot_info->cost_tracker, -1 /* ULONG_MAX */, sizeof(slot_info->cost_tracker) );
   }
+}
+
+/* sched_dead_reason_to_event maps a scheduler dead reason
+   (FD_SCHED_DEAD_REASON_*) onto the telemetry event's dead_reason variant
+   (FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_*). */
+
+static int
+sched_dead_reason_to_event( int sched_reason ) {
+  switch( sched_reason ) {
+    case FD_SCHED_DEAD_REASON_BAD_BLOCK_PARSE:         return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_BAD_BLOCK_PARSE;
+    case FD_SCHED_DEAD_REASON_TOO_MANY_TXNS:           return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_BAD_BLOCK_TOO_MANY_TXNS;
+    case FD_SCHED_DEAD_REASON_TRAILING_ENTRY:          return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_TRAILING_ENTRY;
+    case FD_SCHED_DEAD_REASON_TOO_FEW_TICKS:           return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_TOO_FEW_TICKS;
+    case FD_SCHED_DEAD_REASON_TOO_MANY_TICKS:          return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_TOO_MANY_TICKS;
+    case FD_SCHED_DEAD_REASON_INVALID_TICK_HASH_COUNT: return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_INVALID_TICK_HASH_COUNT;
+    case FD_SCHED_DEAD_REASON_POH_HASH_MISMATCH:       return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_POH_HASH_MISMATCH;
+    case FD_SCHED_DEAD_REASON_DUPLICATE_ACCOUNT:       return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_DUPLICATE_ACCOUNT;
+    case FD_SCHED_DEAD_REASON_DEAD_ANCESTOR:           return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_PARENT_DEAD;
+    /* Abandoned lineage: not a validity ruling; mark_bank_dead maps
+       NOT_DEAD onto an abandoned=pruned row. */
+    case FD_SCHED_DEAD_REASON_ABANDONED_ANCESTOR:      return FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD;
+    default: FD_LOG_CRIT(( "unmapped scheduler dead reason %d", sched_reason ));
+  }
+}
+
+/* block_completed_event_fill_reception fills the reception-side fields
+   of a block_completed event (FEC set count, shred/repair tallies, chain
+   verification, shred timestamps) from the reasm chain ending at mr, for
+   the block in the given slot.  The block's FEC sets are the parent-chain
+   of reasm FECs ending at the slot-complete FEC, whose merkle root is the
+   block id; each FEC carries the repair tile's block-level forest
+   snapshot.  Used by fill_bank and by the bank-less dead-block path. */
+
+static void
+block_completed_event_fill_reception( fd_replay_tile_t *           ctx,
+                                      fd_event_block_completed_t * ev,
+                                      fd_hash_t const *            mr,
+                                      ulong                        slot ) {
+  /* Chain verification walks backwards from the confirmed block id, so a
+     zero here means it reached the first FEC set, i.e. the whole block
+     verified.  Default to the unknown sentinel instead: without a snapshot
+     we have not verified anything, which is the opposite claim. */
+  ev->lowest_verified_fec_index = UINT_MAX;
+
+  fd_reasm_fec_t * chain_tip = fd_reasm_query( ctx->reasm, mr );
+  if( FD_LIKELY( chain_tip ) ) {
+    /* Walk parents to the start of this slot to count FEC sets, detect
+       equivocation (any FEC observed with a conflicting sibling), and pick
+       the freshest forest snapshot.  Repair stamps a snapshot on every
+       FEC-complete, and FEC sets can complete out of order, so the
+       slot-completing FEC's snapshot misses anything repaired after it;
+       the counters are cumulative, so the latest one is the fullest. */
+    ulong n = 0UL;
+    fd_reasm_fec_t * stats = NULL;
+    fd_reasm_fec_t * f     = chain_tip;
+    for( ; f && f->slot==slot; f = fd_reasm_parent( ctx->reasm, f ) ) {
+      n++;
+      if( f->eqvoc ) ev->equivocation_detected_shred = 1;
+      if( f->stats_valid && ( !stats || f->fec_completed_ts_nanos>stats->fec_completed_ts_nanos ) ) stats = f;
+    }
+    ev->fec_set_count = n;
+
+    /* The walk's terminating FEC is in the parent block; recover
+       parent_slot for rows whose bank never learned it. */
+    if( f && !ev->parent_slot ) ev->parent_slot = f->slot;
+
+    if( FD_LIKELY( stats ) ) {
+      ev->turbine_shred_count       = stats->blk_turbine_cnt;
+      ev->repair_shred_count        = stats->blk_repair_cnt;
+      ev->recovered_shred_count     = stats->blk_recovered_cnt;
+      ev->data_shred_count          = stats->blk_data_cnt;
+      ev->parity_shred_count        = stats->blk_parity_cnt;
+      ev->chain_confirmed           = !!stats->blk_chain_confirmed;
+      ev->slot_complete_flag        = !!stats->blk_slot_complete;
+      ev->lowest_verified_fec_index = stats->blk_lowest_verified_fec;
+
+      /* Per-slot repair request/response tallies and shred timestamps
+         (forest snapshot).  Total requests = the sum of the three request
+         kinds (window/highest/orphan), left to the consumer; retransmits
+         (re-sends after a response timeout) are counted separately. */
+      ev->repair_request_window_count         = stats->blk_req_window_cnt;
+      ev->repair_request_highest_window_count = stats->blk_req_highest_cnt;
+      ev->repair_request_orphan_count         = stats->blk_req_orphan_cnt;
+      ev->repair_responses_received           = stats->blk_repair_responses;
+      ev->repair_requests_retransmitted       = stats->blk_req_retransmit_cnt;
+      ev->repair_failed_chain_verify          = !!stats->blk_chain_verify_failed;
+      ev->first_shred_received_time           = stats->blk_first_shred_ts_nanos;
+      ev->last_shred_received_time            = stats->blk_last_shred_ts_nanos;
+      ev->first_repair_request_time           = stats->blk_first_req_ts_nanos;
+      ev->last_repair_received_time           = stats->blk_last_repair_resp_ts_nanos;
+    }
+  }
+}
+
+/* block_completed_event_fill_bank fills the bank-derived fields of a
+   block_completed event (identity, timing milestones, shred count, cost
+   tracker) that are available both when a block completes and when it
+   dies mid-replay.  Shared by the completed and dead paths. */
+
+static void
+block_completed_event_fill_bank( fd_replay_tile_t *           ctx,
+                                 fd_event_block_completed_t * ev,
+                                 fd_bank_t *                  bank ) {
+  fd_bank_t * parent_bank = fd_banks_get_parent( ctx->banks, bank );
+
+  /* Until replay_block_start / prepare_leader_bank clones f from the
+     parent (also stamping preparation_begin_nanos, zeroed on
+     allocation), the recycled pool element still holds the previous
+     tenant's f; key identity off the block id ele instead. */
+  int   prepared = bank->preparation_begin_nanos!=0L;
+  ulong slot     = prepared ? bank->f.slot : ctx->block_id_arr[ bank->idx ].slot;
+
+  ev->bank_seq    = bank->bank_seq;
+  ev->slot        = slot;
+  ev->parent_slot = prepared                    ? bank->f.parent_slot
+                  : bank->parent_idx!=ULONG_MAX ? ctx->block_id_arr[ bank->parent_idx ].slot
+                  :                               0UL;
+  if(      FD_LIKELY( prepared )                  ) ev->epoch = bank->f.epoch;
+  else if( FD_LIKELY( ctx->notified_root_bank ) ) ev->epoch = fd_slot_to_epoch( &ctx->notified_root_bank->f.epoch_schedule, slot, NULL );
+  fd_memcpy( ev->block_id, ctx->block_id_arr[ bank->idx ].latest_mr.uc, sizeof(ev->block_id) );
+  /* Only a frozen bank has a valid hash (computed by finalize, before the
+     freeze stamp); the memset already zeroed it otherwise. */
+  if( FD_LIKELY( bank->block_completed_nanos ) ) fd_memcpy( ev->bank_hash, bank->f.bank_hash.uc, sizeof(ev->bank_hash) );
+
+  /* Replay timing milestones (nanoseconds since the unix epoch).  The bank
+     records its creation time as first_fec_set_received_nanos, which is
+     only a FEC arrival for a block we replay; a leader bank is created on
+     becoming leader, and that moment is reported as became_leader_time. */
+  ev->first_fec_set_received_time      = bank->is_leader ? 0UL : (ulong)bank->first_fec_set_received_nanos;
+  ev->preparation_begin_time           = (ulong)bank->preparation_begin_nanos;
+  ev->first_transaction_scheduled_time = (ulong)bank->first_transaction_scheduled_nanos;
+  ev->last_transaction_finished_time   = (ulong)bank->last_transaction_finished_nanos;
+  ev->block_completed_time             = (ulong)bank->block_completed_nanos;
+  ev->parent_block_completed_time      = parent_bank ? (ulong)parent_bank->block_completed_nanos : 0UL;
+
+  /* Cost tracker (mirrors cost_tracker_snap).  Only incomplete rows still
+     hold the tracker; completed rows are filled from the pre-freeze
+     snapshot in report_block_completed. */
+  if( FD_UNLIKELY( bank->cost_tracker_pool_idx!=ULONG_MAX ) ) {
+    fd_cost_tracker_t const * ct = fd_bank_cost_tracker_query( bank );
+    ev->cost_tracker_block_cost                   = ct->block_cost;
+    ev->cost_tracker_vote_cost                    = ct->vote_cost;
+    ev->cost_tracker_allocated_accounts_data_size = ct->allocated_accounts_data_size;
+    ev->cost_tracker_block_cost_limit             = ct->block_cost_limit;
+    ev->cost_tracker_vote_cost_limit              = ct->vote_cost_limit;
+    ev->cost_tracker_account_cost_limit           = ct->account_cost_limit;
+  }
+
+  block_completed_event_fill_reception( ctx, ev, &ctx->block_id_arr[ bank->idx ].latest_mr, slot );
+}
+
+/* report_block_completed emits the block_completed telemetry event for a
+   block that finished replaying.  It is a fire-and-forget no-op when no
+   event link is wired (telemetry off).
+
+   Populated here (see block_completed_event_fill_bank):
+     - block identity, root/storage slots, replay timing milestones,
+       total shred count (from the bank); cost tracker from the pre-freeze
+       snapshot taken for the slot-completed message (the bank's tracker
+       is released at freeze)
+     - shred breakdown (data/parity/turbine/repair/recovered counts,
+       chain_confirmed, lowest_verified_fec, slot_complete, FEC set count,
+       equivocation) from the repair tile's forest snapshot carried on the
+       FEC-complete message and stashed on the reasm FEC.
+     - per-slot repair tallies (window/highest/orphan request counts,
+       repair_requests_retransmitted,
+       repair_responses_received), repair_failed_chain_verify, and shred
+       timestamps (first/last_shred_received_time,
+       first_repair_request_time, last_repair_received_time), also from
+       the forest snapshot.
+     - leader/pack scalars (became_leader_time, leader_slot_start_time,
+       pack_start/end_time, microblock_count,
+       pack_block/vote_cost, pack_data_bytes, pack_end_reason,
+       bundle_txn_count) — leader
+       blocks only — from the per-leader-slot stash (became-leader L1 +
+       the pack/poh summary carried on the slot-ended message); see
+       block_completed_event_fill_leader.
+     - txn_timing[]: follower blocks from the per-bank capture slots
+       (leased in replay_block_start, written in publish_txn_executed);
+       leader blocks from the shared poh timing table ("ldr_tt"), written
+       at mix time.  See report_block_completed. */
+
+/* pack_end_reason_to_event maps a pack FD_PACK_END_REASON_* onto the
+   block_completed event's pack_end_reason variant. */
+
+static int
+pack_end_reason_to_event( int fine ) {
+  switch( fine ) {
+    case FD_PACK_END_REASON_TIME:             return FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_TIME;
+    case FD_PACK_END_REASON_CU_LIMIT:         return FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_CU_LIMIT;
+    case FD_PACK_END_REASON_DATA_LIMIT:       return FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_DATA_LIMIT;
+    case FD_PACK_END_REASON_MICROBLOCK_LIMIT: return FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_MICROBLOCK_LIMIT;
+    case FD_PACK_END_REASON_LEADER_SWITCH:    return FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_LEADER_SWITCH;
+    /* get_done_packing always sets one of the above, and poh only ends a
+       leader slot after it, so an unknown reason is a bug; abort like
+       sched_dead_reason_to_event rather than publish a guess. */
+    default:                                  FD_LOG_CRIT(( "unmapped pack end reason %d", fine ));
+  }
+}
+
+/* block_completed_event_fill_leader fills the leader/pack fields of the
+   event from the per-leader-slot stash (ctx->leader_stats), captured when
+   we became leader (L1) and from the poh slot-ended summary (L2/L3).  Only
+   valid when the stash matches this block's slot. */
+
+static void
+block_completed_event_fill_leader( fd_replay_tile_t *           ctx,
+                                   fd_event_block_completed_t * ev,
+                                   fd_bank_t *                  bank ) {
+  /* A leader block always reaches here with its stash populated: tower's
+     slot-completed (gated on recv_poh) only fires after poh's slot-ended
+     message, and poh only ends a leader slot after pack's done_packing
+     (see fd_poh.c).  The slot must match the one we became leader for. */
+  FD_TEST( ctx->leader_stats.slot==bank->f.slot );
+
+  ev->became_leader_time     = (ulong)ctx->leader_stats.became_leader_nanos;
+  ev->leader_slot_start_time = (ulong)ctx->leader_stats.leader_slot_start_nanos;
+
+  /* Production counterpart of the follower stamp: our own first FEC set
+     arriving back at replay, rather than the bank's creation time. */
+  ev->first_fec_set_received_time = (ulong)ctx->leader_stats.first_fec_returned_nanos;
+
+  /* Own shreds come back tagged recovered (shredder FECs carry no
+     receipt counts); a leader recovers nothing. */
+  ev->recovered_shred_count = 0UL;
+
+  ev->microblock_count    = ctx->leader_stats.microblock_count;
+  ev->pack_block_cost     = ctx->leader_stats.pack_block_cost;
+  ev->pack_vote_cost      = ctx->leader_stats.pack_vote_cost;
+  ev->pack_data_bytes     = ctx->leader_stats.pack_data_bytes;
+  ev->bundle_txn_count    = ctx->leader_stats.bundle_txn_count;
+  ev->pack_start_time     = (ulong)ctx->leader_stats.pack_start_nanos;
+  ev->pack_end_time       = (ulong)ctx->leader_stats.pack_end_nanos;
+  ev->pack_end_reason     = pack_end_reason_to_event( ctx->leader_stats.pack_end_reason );
+}
+
+static void
+report_block_completed( fd_replay_tile_t *                 ctx,
+                        fd_bank_t *                        bank,
+                        int                                is_leader,
+                        fd_replay_slot_completed_t const * slot_info ) {
+  if( FD_LIKELY( !fd_event_tl ) ) return; /* telemetry off */
+
+  fd_event_block_completed_t * ev = ctx->block_completed_event;
+  memset( ev, 0, FD_EVENT_BLOCK_COMPLETED_PREFIX_SZ ); /* txn_timing[] rows are assigned whole below */
+
+  block_completed_event_fill_bank( ctx, ev, bank );
+
+  /* The bank's cost tracker was released at freeze, before this runs, so
+     fill_bank's live read never fires here; use the pre-freeze snapshot
+     taken for the slot-completed message.  ULONG_MAX marks an unavailable
+     snapshot; keep the zeros then. */
+  if( FD_LIKELY( slot_info->cost_tracker.block_cost_limit!=ULONG_MAX ) ) {
+    ev->cost_tracker_block_cost                   = slot_info->cost_tracker.block_cost;
+    ev->cost_tracker_vote_cost                    = slot_info->cost_tracker.vote_cost;
+    ev->cost_tracker_allocated_accounts_data_size = slot_info->cost_tracker.allocated_accounts_data_size;
+    ev->cost_tracker_block_cost_limit             = slot_info->cost_tracker.block_cost_limit;
+    ev->cost_tracker_vote_cost_limit              = slot_info->cost_tracker.vote_cost_limit;
+    ev->cost_tracker_account_cost_limit           = slot_info->cost_tracker.account_cost_limit;
+  }
+
+  ev->root_slot    = ctx->consensus_root_slot;
+  ev->storage_slot = ctx->published_root_slot;
+  ev->is_leader    = is_leader;
+
+  ev->pack_end_reason = FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_NOT_LEADER; /* fill_leader overwrites */
+  if( FD_UNLIKELY( is_leader ) ) block_completed_event_fill_leader( ctx, ev, bank );
+
+  ev->dead             = 0;
+  ev->dead_reason      = FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD;
+  ev->dead_time        = 0UL;
+  ev->abandoned        = 0;
+  ev->abandoned_reason = FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_NOT_ABANDONED;
+  ev->abandoned_time   = 0UL;
+
+  /* txn_timing[]: per-txn lifecycle timestamps, in block order, converting
+     TSC ticks to epoch nanos with a single anchor pair.  Ticks never
+     stamped (LONG_MAX) map to 0 (unavailable).
+
+     Follower blocks: copied from the bank's leased capture slot, filled as
+     each txn completed replay.  A block only completes once every txn
+     completed, so entries [0, cnt) are fully populated.
+
+     Leader blocks: read from the shared table poh filled in mix order (the
+     leased-slot path never ran; leader banks are created via
+     prepare_leader_bank, not replay_block_start).  Safe to read directly
+     without copying: poh cannot begin another leader slot until this block
+     completes, and only reuses this table two leader slots from now. */
+  long anc_tick = fd_tickcount();
+  long anc_ns   = fd_log_wallclock();
+# define TICK_TO_NS( tick ) ((tick)==LONG_MAX ? 0UL : (ulong)(anc_ns + (long)( (double)((tick)-anc_tick)/ctx->tick_per_ns )))
+  if( FD_UNLIKELY( is_leader ) ) {
+    ulong tidx = ctx->leader_stats.timing_table_idx;
+    if( FD_LIKELY( ctx->leader_txn_timing && tidx<FD_LEADER_TXN_TIMING_TABLE_CNT ) ) {
+      fd_leader_txn_timing_table_t const * table = &ctx->leader_txn_timing[ tidx ];
+      if( FD_LIKELY( table->slot==bank->f.slot ) ) { /* stale-table guard (abandoned slot / poh reset) */
+        ulong cnt = fd_ulong_min( table->cnt, FD_EVENT_BLOCK_COMPLETED_TXN_TIMING_MAX );
+        long  first_dispatch = LONG_MAX;
+        for( ulong i=0UL; i<cnt; i++ ) {
+          fd_leader_txn_timing_rec_t const * rec = &table->rec[ i ];
+          first_dispatch = fd_long_min( first_dispatch, rec->dispatched_ticks );
+          /* parsed / sigverify_* zero-fill: verified before pack */
+          ev->txn_timing[ i ] = (fd_event_block_completed_txn_timing_t){
+            .received_time   = (ulong)rec->received_ns, /* already wallclock */
+            .dispatched_time = TICK_TO_NS( rec->dispatched_ticks ),
+            .replayed_time   = TICK_TO_NS( rec->replayed_ticks   ),
+            .poh_mixed_time  = TICK_TO_NS( rec->poh_mixed_ticks  ),
+          };
+        }
+        ev->txn_timing_cnt = cnt;
+
+        /* The bank's first_transaction_scheduled_nanos is only stamped on
+           the replay dispatch path, so it is zero here.  Its production
+           analogue is the earliest execution start, which would otherwise
+           leave the execution window open-ended against the populated
+           last_transaction_finished_time. */
+        ev->first_transaction_scheduled_time = TICK_TO_NS( first_dispatch );
+      }
+    }
+  } else {
+    ulong tslot = ctx->timing_slot_of_bank[ bank->idx ];
+    if( FD_LIKELY( tslot!=ULONG_MAX ) ) {
+      ulong cnt = fd_ulong_min( ctx->timing_slot_cnt[ tslot ], FD_EVENT_BLOCK_COMPLETED_TXN_TIMING_MAX );
+      for( ulong i=0UL; i<cnt; i++ ) {
+        fd_replay_txn_timing_t const * t = &ctx->timing_slots[ tslot ][ i ];
+        /* poh_mixed_time zero-fills: not produced by this validator */
+        ev->txn_timing[ i ] = (fd_event_block_completed_txn_timing_t){
+          .received_time             = (ulong)t->received_ns, /* already wallclock */
+          .parsed_time               = TICK_TO_NS( t->parsed         ),
+          .sigverify_dispatched_time = TICK_TO_NS( t->sigverify_disp ),
+          .sigverify_done_time       = TICK_TO_NS( t->sigverify_done ),
+          .dispatched_time           = TICK_TO_NS( t->exec_disp      ),
+          .replayed_time             = TICK_TO_NS( t->exec_done      ),
+        };
+      }
+      ev->txn_timing_cnt = cnt;
+    }
+  }
+# undef TICK_TO_NS
+
+  /* A block that executed no transactions has no execution window: report
+     it empty rather than leaving a zero start against a populated end for
+     consumers to subtract.  Mirrors the slot-completed message. */
+  if( FD_UNLIKELY( !ev->first_transaction_scheduled_time ) ) ev->first_transaction_scheduled_time = ev->last_transaction_finished_time;
+
+  fd_event_report_block_completed( ev );
 }
 
 static void
@@ -453,7 +832,87 @@ publish_slot_completed( fd_replay_tile_t *  ctx,
 
   fd_stem_publish( stem, ctx->replay_out->idx, REPLAY_SIG_SLOT_COMPLETED, ctx->replay_out->chunk, sizeof(fd_replay_slot_completed_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
   ctx->replay_out->chunk = fd_dcache_compact_next( ctx->replay_out->chunk, sizeof(fd_replay_slot_completed_t), ctx->replay_out->chunk0, ctx->replay_out->wmark );
+
+  /* Skip the telemetry event for the initial boot block (snapshot /
+     genesis): it was not replayed, so its timing milestones are unset.
+     Its confirmation events still flow; the dangling bank_seq 1 join is
+     documented in both schemas. */
+  if( FD_LIKELY( !is_initial ) ) report_block_completed( ctx, bank, is_leader, slot_info );
+  timing_slot_release( ctx, bank->idx );
 }
+
+/* report_block_incomplete emits a block_completed telemetry event for a
+   block that never completed, because it was ruled invalid (dead_reason)
+   or because we stopped tracking it (abandoned_reason).  The two are
+   independent: exactly one is normally set, and an abandoned block is not
+   invalid.  bank may be NULL (e.g. a dead slot completed only as a
+   sentinel, with no replayed bank); when non-NULL its identity/timing/cost
+   fields enrich the event. */
+
+static void
+report_block_incomplete( fd_replay_tile_t * ctx,
+                   ulong              slot,
+                   fd_hash_t const *  block_id,
+                   fd_bank_t *        bank,
+                   int                dead_reason,
+                   int                abandoned_reason ) {
+  /* When we have the bank, fill in whatever was accumulated before the
+     block was ruled dead or abandoned (identity, partial timing, shred
+     count, cost tracker); otherwise fall back to just the slot and block
+     id. */
+  if( FD_UNLIKELY( fd_event_tl ) ) {
+    fd_event_block_completed_t * ev = ctx->block_completed_event;
+    memset( ev, 0, FD_EVENT_BLOCK_COMPLETED_PREFIX_SZ ); /* cnt stays 0, so no txn_timing[] rows ship */
+    if( FD_LIKELY( bank ) ) {
+      block_completed_event_fill_bank( ctx, ev, bank );
+      ev->is_leader = !!bank->is_leader;
+    } else {
+      /* No bank was ever allocated for this block (e.g. the child of a
+         dead parent, which is never replayed), so there is no bank_seq to
+         join on.  bank_seq counts from 1 and reserves 0 as its invalid
+         sentinel, so the memset already says exactly that.  Forward
+         confirmations for such a block, if any, join on slot+block_id. */
+      ev->slot = slot;
+      /* The epoch is a pure function of the slot; derive it from the root
+         bank's schedule so bank-less dead blocks still aggregate by epoch. */
+      if( FD_LIKELY( ctx->notified_root_bank ) )
+        ev->epoch = fd_slot_to_epoch( &ctx->notified_root_bank->f.epoch_schedule, slot, NULL );
+      fd_memcpy( ev->block_id, block_id->uc, sizeof(ev->block_id) );
+      /* Reasm still holds the block's FEC chain at the (sole) bank-less
+         call site, the slot-complete drop path; report its reception
+         stats rather than zeros. */
+      block_completed_event_fill_reception( ctx, ev, block_id, slot );
+    }
+    ev->root_slot    = ctx->consensus_root_slot;
+    ev->storage_slot = ctx->published_root_slot;
+
+    /* Flags derived from the reasons so the two can never disagree. */
+    int  dead      = dead_reason     !=FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD;
+    int  abandoned = abandoned_reason!=FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_NOT_ABANDONED;
+    long now       = fd_log_wallclock();
+
+    ev->dead             = dead;
+    ev->dead_reason      = dead_reason;
+    ev->dead_time        = dead      ? (ulong)now : 0UL;
+    ev->abandoned        = abandoned;
+    ev->abandoned_reason = abandoned_reason;
+    ev->abandoned_time   = abandoned ? (ulong)now : 0UL;
+
+    /* Always not_leader: a block we produced cannot reach here.  Leader
+       banks are excluded from eviction outright, hold a refcnt that blocks
+       the root advance until they are frozen (by which point they have
+       already reported completed, so pruning skips them), and their FECs
+       never enter the scheduler that rules blocks dead. */
+    ev->pack_end_reason = FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_NOT_LEADER;
+
+    fd_event_report_block_completed( ev );
+  }
+}
+
+/* publish_slot_dead publishes the SLOT_DEAD message for a block newly
+   known dead.  Telemetry rows are emitted separately: per bank when it
+   is marked dead (mark_bank_dead), or at slot completion for blocks
+   that never got a bank (process_fec_set). */
 
 static void
 publish_slot_dead( fd_replay_tile_t *  ctx,
@@ -470,8 +929,25 @@ publish_slot_dead( fd_replay_tile_t *  ctx,
 static void
 publish_txn_executed( fd_replay_tile_t *  ctx,
                       fd_stem_context_t * stem,
+                      ulong               bank_idx,
                       ulong               txn_idx ) {
   fd_sched_txn_info_t * txn_info = fd_sched_get_txn_info( ctx->sched, txn_idx );
+
+  /* Capture the txn's lifecycle ticks into the bank's leased timing slot
+     (if any) before the scheduler recycles txn_info.  index_in_slot is the
+     txn's block-order position, so the slot fills in block order. */
+  ulong tslot = ctx->timing_slot_of_bank[ bank_idx ];
+  if( FD_LIKELY( tslot!=ULONG_MAX && txn_info->index_in_slot<FD_MAX_TXN_PER_SLOT ) ) {
+    fd_replay_txn_timing_t * t = &ctx->timing_slots[ tslot ][ txn_info->index_in_slot ];
+    t->received_ns    = txn_info->received_ns;
+    t->parsed         = txn_info->tick_parsed;
+    t->sigverify_disp = txn_info->tick_sigverify_disp;
+    t->sigverify_done = txn_info->tick_sigverify_done;
+    t->exec_disp      = txn_info->tick_exec_disp;
+    t->exec_done      = txn_info->tick_exec_done;
+    ctx->timing_slot_cnt[ tslot ] = fd_ulong_max( ctx->timing_slot_cnt[ tslot ], txn_info->index_in_slot+1UL );
+  }
+
   fd_replay_txn_executed_t * txn_executed = fd_type_pun( fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk ) );
   *txn_executed->txn = *fd_sched_get_txn( ctx->sched, txn_idx );
   txn_executed->txn_err = txn_info->txn_err;
@@ -914,6 +1390,18 @@ try_become_leader( fd_replay_tile_t *  ctx,
   ctx->is_leader = 1;
   ctx->recv_poh  = 0;
 
+  /* Telemetry: stash L1 leader timings for the block_completed event.
+     became_leader_time is the actual moment we became leader; the slot's
+     scheduled start is next_leader_tickcount (a tickcount) converted to
+     wallclock so "how late" is meaningful.  The pack/poh summary arrives
+     later on the slot-ended message. */
+  memset( &ctx->leader_stats, 0, sizeof(ctx->leader_stats) );
+  ctx->leader_stats.slot                = ctx->next_leader_slot;
+  ctx->leader_stats.timing_table_idx    = ULONG_MAX;
+  ctx->leader_stats.became_leader_nanos = now_nanos;
+  ctx->leader_stats.leader_slot_start_nanos =
+    now_nanos + (long)( (double)( ctx->next_leader_tickcount - now ) / ctx->tick_per_ns );
+
   FD_TEST( ctx->highwater_leader_slot==ULONG_MAX || ctx->highwater_leader_slot<ctx->next_leader_slot );
   ctx->highwater_leader_slot = ctx->next_leader_slot;
 
@@ -1016,6 +1504,20 @@ process_poh_message( fd_replay_tile_t *                 ctx,
      it has been shredded. */
 
   memcpy( &ctx->leader_bank->f.poh, slot_ended->blockhash, sizeof(fd_hash_t) );
+
+  /* Telemetry: stash the pack/poh leader summary for the block_completed
+     event, guarded so a stale message can't poison a different slot. */
+  if( FD_LIKELY( ctx->leader_stats.slot==slot_ended->slot ) ) {
+    ctx->leader_stats.microblock_count    = slot_ended->microblock_count;
+    ctx->leader_stats.pack_block_cost     = slot_ended->pack_block_cost;
+    ctx->leader_stats.pack_vote_cost      = slot_ended->pack_vote_cost;
+    ctx->leader_stats.pack_data_bytes     = slot_ended->pack_data_bytes;
+    ctx->leader_stats.bundle_txn_count    = slot_ended->bundle_txn_count;
+    ctx->leader_stats.pack_end_reason     = slot_ended->pack_end_reason;
+    ctx->leader_stats.pack_start_nanos    = slot_ended->pack_start_ns;
+    ctx->leader_stats.pack_end_nanos      = slot_ended->pack_end_ns;
+    ctx->leader_stats.timing_table_idx    = slot_ended->timing_table_idx;
+  }
 
   ctx->recv_poh = 1;
 }
@@ -1424,21 +1926,47 @@ dispatch_task( fd_replay_tile_t *  ctx,
   }
 }
 
+/* mark_bank_dead marks the bank (and its descendants) dead and publishes
+   the dead-slot message + telemetry.  dead_reason is the telemetry
+   FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_* variant the block was ruled
+   invalid for, or NOT_DEAD for a block whose lineage was abandoned
+   rather than ruled invalid: rows then report abandoned=pruned while the
+   bank machinery treats both cases the same. */
+
 static void
 mark_bank_dead( fd_replay_tile_t *  ctx,
                 fd_stem_context_t * stem,
-                ulong               bank_idx ) {
+                ulong               bank_idx,
+                int                 dead_reason ) {
   ulong dead_idxs[ FD_BANKS_MAX_BANKS ];
   ulong dead_idxs_cnt = 0UL;
-  fd_banks_mark_bank_dead( ctx->banks, bank_idx, dead_idxs, &dead_idxs_cnt );
+  ulong was_prunable  = fd_banks_mark_bank_dead( ctx->banks, bank_idx, dead_idxs, &dead_idxs_cnt );
 
   fd_block_id_ele_t * block_id_ele = &ctx->block_id_arr[ bank_idx ];
-  if( block_id_ele->block_id_seen ) publish_slot_dead( ctx, stem, block_id_ele->slot, &block_id_ele->latest_mr );
+  if( block_id_ele->block_id_seen ) {
+    publish_slot_dead( ctx, stem, block_id_ele->slot, &block_id_ele->latest_mr );
+  }
 
+  /* Report each newly dead bank now (dead_idxs excludes already-dead,
+     already-reported subtrees): the failing bank with its real reason and
+     descendants as parent_dead, or the whole lineage as abandoned=pruned.
+     A previously PRUNABLE (evicted) bank already reported and is only
+     flagged.  Blocks still receiving FECs dedup the slot-completion
+     report via dead_reported. */
+  int abandoned = dead_reason==FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD;
   for( ulong i=0UL; i<dead_idxs_cnt; i++ ) {
-    fd_block_id_ele_t * block_id_ele = &ctx->block_id_arr[ dead_idxs[ i ] ];
-    fd_reasm_fec_t *    fec          = fd_reasm_query( ctx->reasm, &block_id_ele->latest_mr );
-    if( FD_LIKELY( fec ) ) fec->bank_dead = 1;
+    fd_block_id_ele_t * ele = &ctx->block_id_arr[ dead_idxs[ i ] ];
+    fd_reasm_fec_t *    fec = fd_reasm_query( ctx->reasm, &ele->latest_mr );
+    if( FD_LIKELY( fec ) ) { fec->bank_dead = abandoned ? 2UL : 1UL; fec->dead_reported = 1; }
+    timing_slot_release( ctx, dead_idxs[ i ] );
+    if( FD_UNLIKELY( dead_idxs[ i ]==was_prunable ) ) continue; /* reported at eviction */
+    fd_bank_t * bank = fd_banks_bank_query( ctx->banks, dead_idxs[ i ] );
+    int dr = abandoned                 ? FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD
+           : dead_idxs[ i ]==bank_idx  ? dead_reason
+           :                             FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_PARENT_DEAD;
+    int ar = abandoned ? FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_PRUNED
+                       : FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_NOT_ABANDONED;
+    report_block_incomplete( ctx, ele->slot, &ele->latest_mr, bank, dr, ar );
   }
 }
 
@@ -1476,7 +2004,7 @@ try_replay( fd_replay_tile_t *  ctx,
       break;
     }
     case FD_SCHED_TT_MARK_DEAD: {
-      mark_bank_dead( ctx, stem, task->mark_dead->bank_idx );
+      mark_bank_dead( ctx, stem, task->mark_dead->bank_idx, sched_dead_reason_to_event( fd_sched_get_dead_reason( ctx->sched, task->mark_dead->bank_idx ) ) );
       break;
     }
     default: {
@@ -1624,6 +2152,15 @@ insert_fec_set( fd_replay_tile_t *  ctx,
        to the FEC.  Remove stale block id map entry if any and update
        pool element. */
     fd_bank_t * bank = reasm_fec->is_leader ? ctx->leader_bank : fd_banks_new_bank( ctx->banks, reasm_fec->parent_bank_idx, now, 0 );
+
+    /* Telemetry: for a block we are producing, this is our own first FEC
+       set arriving back through reassembly, the production counterpart of
+       a follower's first_fec_set_received.  The bank's own stamp is its
+       creation time (become-leader), so keep this separate. */
+    if( FD_UNLIKELY( reasm_fec->is_leader && ctx->leader_stats.slot==reasm_fec->slot ) ) {
+      ctx->leader_stats.first_fec_returned_nanos = now;
+    }
+
     reasm_fec->bank_idx = bank->idx;
     reasm_fec->bank_seq = bank->bank_seq;
 
@@ -1687,6 +2224,7 @@ insert_fec_set( fd_replay_tile_t *  ctx,
   sched_fec->is_first_in_block = reasm_fec->fec_set_idx==0U;
   sched_fec->fec               = store_fec;
   sched_fec->data              = fd_store_fec_data( ctx->store, store_fec );
+  sched_fec->completed_ts_nanos = (long)reasm_fec->fec_completed_ts_nanos;
   sched_fec->alut_ctx->fork_id = fd_banks_bank_query( ctx->banks, ctx->published_root_bank_idx )->accdb_fork_id;
   sched_fec->alut_ctx->accdb   = ctx->accdb;
   sched_fec->alut_ctx->els     = ctx->published_root_slot;
@@ -1698,7 +2236,11 @@ insert_fec_set( fd_replay_tile_t *  ctx,
   }
 
   if( FD_UNLIKELY( !fd_sched_fec_ingest( ctx->sched, sched_fec ) ) ) {
-    mark_bank_dead( ctx, stem, sched_fec->bank_idx );
+    /* The scheduler ruled the block invalid while ingesting this FEC set,
+       or the block joined a dying lineage: dead_ancestor for a dead
+       lineage, abandoned_ancestor for a discarded one, which maps to an
+       abandoned (pruned) row rather than a dead one. */
+    mark_bank_dead( ctx, stem, sched_fec->bank_idx, sched_dead_reason_to_event( fd_sched_get_dead_reason( ctx->sched, sched_fec->bank_idx ) ) );
     return 1;
   }
 
@@ -1766,11 +2308,23 @@ process_fec_set( fd_replay_tile_t *  ctx,
 
   fd_reasm_fec_t * parent = fd_reasm_parent( ctx->reasm, reasm_fec );
   if( FD_UNLIKELY( parent->bank_dead ) ) {
-    /* Inherit the dead flag from the parent.  If a dead slot is
-       completed, we publish the slot as dead.  Don't insert FECs for
-       dead slots. */
-    reasm_fec->bank_dead = 1;
-    if( FD_UNLIKELY( reasm_fec->slot_complete ) ) publish_slot_dead( ctx, stem, reasm_fec->slot, &reasm_fec->key );
+    /* Inherit the dead flag from the parent (1: dead lineage, 2:
+       abandoned lineage).  If a dead slot is completed, we publish the
+       slot as dead.  Don't insert FECs for dead slots.  dead_reported
+       only travels within the slot: a child block chaining onto a dead
+       parent slot never had a bank or a row, so its completion still
+       reports (bank-less, flavored by the lineage). */
+    reasm_fec->bank_dead     = parent->bank_dead;
+    reasm_fec->dead_reported = parent->slot==reasm_fec->slot ? parent->dead_reported : 0UL;
+    if( FD_UNLIKELY( reasm_fec->slot_complete ) ) {
+      publish_slot_dead( ctx, stem, reasm_fec->slot, &reasm_fec->key );
+      if( !reasm_fec->dead_reported ) {
+        int abandoned = reasm_fec->bank_dead==2UL;
+        report_block_incomplete( ctx, reasm_fec->slot, &reasm_fec->key, NULL,
+                                 abandoned ? FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD    : FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_PARENT_DEAD,
+                                 abandoned ? FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_PRUNED : FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_NOT_ABANDONED );
+      }
+    }
     FD_LOG_DEBUG(( "dropping FEC set (slot=%lu, fec_set_idx=%u) because parent bank is marked dead", reasm_fec->slot, reasm_fec->fec_set_idx ));
     return;
   }
@@ -1913,6 +2467,35 @@ try_advance_published_root( fd_replay_tile_t *  ctx,
   }
   fd_block_id_ele_t * advanceable_root_ele = &ctx->block_id_arr[ advanceable_root_idx ];
 
+  /* Telemetry: banks still mid-replay (started but never completed) on
+     forks not descending from the new root are about to be cancelled by
+     fd_banks_advance_root without ever emitting a block_completed row.
+     Emit them as abandoned with reason `pruned`: the block was not
+     invalid, it lost the fork race.  Frozen banks already emitted a
+     completed row and dead banks a dead row, so only INIT/REPLAYABLE
+     need reporting.  A bank survives the advance iff the new root is its
+     ancestor.  This can burst up to block_id_len rows into the shallow
+     (depth 8 at max MTU) unreliable event ring, so under heavy forking
+     correlated pruned rows may drop: best-effort by design. */
+  if( FD_UNLIKELY( fd_event_tl ) ) {
+    for( ulong i=0UL; i<ctx->block_id_len; i++ ) {
+      fd_bank_t * cand = fd_banks_bank_query( ctx->banks, i );
+      if( FD_LIKELY( !cand ) ) continue;
+      if( FD_LIKELY( cand->state!=FD_BANK_STATE_INIT && cand->state!=FD_BANK_STATE_REPLAYABLE ) ) continue;
+      int survives = 0;
+      for( ulong a=i; a!=ULONG_MAX; ) {
+        if( a==advanceable_root_idx ) { survives = 1; break; }
+        fd_bank_t * b = fd_banks_bank_query( ctx->banks, a );
+        if( FD_UNLIKELY( !b ) ) break;
+        a = b->parent_idx;
+      }
+      if( FD_UNLIKELY( !survives ) ) {
+        fd_block_id_ele_t * ele = &ctx->block_id_arr[ i ];
+        report_block_incomplete( ctx, ele->slot, &ele->latest_mr, cand, FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD, FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_PRUNED );
+      }
+    }
+  }
+
   ulong advanceable_root_slot = bank->f.slot;
   fd_txncache_advance_root( ctx->txncache, bank->txncache_fork_id );
   fd_progcache_advance_root( ctx->progcache, bank->progcache_fork_id );
@@ -1920,6 +2503,14 @@ try_advance_published_root( fd_replay_tile_t *  ctx,
   fd_sched_advance_root( ctx->sched, advanceable_root_idx );
   fd_banks_advance_root( ctx->banks, advanceable_root_idx );
   fd_reasm_publish( ctx->reasm, &advanceable_root_ele->latest_mr, ctx->store );
+
+  /* Sweep txn-timing leases of banks the advance just cancelled,
+     unconditionally (the telemetry loop above only runs with an event
+     link wired; lease bookkeeping must not depend on it). */
+  for( ulong i=0UL; i<FD_REPLAY_TXN_TIMING_SLOTS; i++ ) {
+    ulong b = ctx->timing_slot_bank[ i ];
+    if( FD_UNLIKELY( b!=ULONG_MAX && !fd_banks_bank_query( ctx->banks, b ) ) ) timing_slot_release( ctx, b );
+  }
 
   ctx->published_root_slot     = advanceable_root_slot;
   ctx->published_root_bank_idx = advanceable_root_idx;
@@ -2059,6 +2650,22 @@ try_process_fec( fd_replay_tile_t *  ctx,
 
     FD_LOG_WARNING(( "banks full, evicting bank (idx=%lu)", evictable_bank_idx ));
 
+    /* Telemetry: an evicted block is abandoned without completing.  It is
+       not invalid (it may be re-replayed later, producing a second,
+       completed row), but it should still be visible in the data.  A
+       frozen victim already reported a completed row (the selector has
+       flipped its state to PRUNABLE, so test the freeze stamp instead,
+       zeroed on allocation); don't claim it was abandoned. */
+    fd_bank_t * evicted_bank = fd_banks_bank_query( ctx->banks, evictable_bank_idx );
+    if( FD_UNLIKELY( !evicted_bank->block_completed_nanos ) ) {
+      fd_block_id_ele_t * block_id_ele = &ctx->block_id_arr[ evictable_bank_idx ];
+      report_block_incomplete( ctx, block_id_ele->slot, &block_id_ele->latest_mr,
+                               evicted_bank,
+                               FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD,
+                               FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_EVICTED );
+    }
+    timing_slot_release( ctx, evictable_bank_idx );
+
     /* Send a notification to other tiles to drop a reference to the
        evictable bank.  The RPC tile is the only tile which holds onto
        non-rooted banks, non-transiently. */
@@ -2193,8 +2800,28 @@ process_exec_task_done( fd_replay_tile_t *          ctx,
       }
       if( FD_UNLIKELY( !msg->txn_exec->is_committable && bank->state!=FD_BANK_STATE_DEAD) ) {
         /* Every transaction in a valid block has to execute.
-           Otherwise, we should mark the block as dead. */
-        mark_bank_dead( ctx, stem, bank->idx );
+           Otherwise, we should mark the block as dead.  Non-committable
+           means the txn failed before account loading or failed the cost
+           tracker; txn_err distinguishes the cases for telemetry. */
+        int dead_reason;
+        switch( msg->txn_exec->txn_err ) {
+          case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_BLOCK_COST_LIMIT:
+            dead_reason = FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_BLOCK_COST_LIMIT;
+            break;
+          case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT:
+            dead_reason = FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_ACCOUNT_COST_LIMIT;
+            break;
+          case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_VOTE_COST_LIMIT:
+            dead_reason = FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_VOTE_COST_LIMIT;
+            break;
+          case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT:
+          case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_ACCOUNT_DATA_TOTAL_LIMIT:
+            dead_reason = FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_ACCOUNT_DATA_LIMIT;
+            break;
+          default:
+            dead_reason = FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_TXN_FAILED_TO_LOAD;
+        }
+        mark_bank_dead( ctx, stem, bank->idx, dead_reason );
         fd_sched_block_abandon( ctx->sched, bank->idx );
       }
       int res = fd_sched_task_done( ctx->sched, FD_SCHED_TT_TXN_EXEC, txn_idx, exec_tile_idx, NULL );
@@ -2207,7 +2834,7 @@ process_exec_task_done( fd_replay_tile_t *          ctx,
         txn_info->flags  |= fd_ulong_if( msg->txn_exec->is_fees_only,   FD_SCHED_TXN_IS_FEES_ONLY,   0UL );
       }
       if( FD_UNLIKELY( (txn_info->flags&FD_SCHED_TXN_REPLAY_DONE)==FD_SCHED_TXN_REPLAY_DONE ) ) { /* UNLIKELY because generally exec happens before sigverify. */
-        publish_txn_executed( ctx, stem, txn_idx );
+        publish_txn_executed( ctx, stem, bank->idx, txn_idx );
       }
       break;
     }
@@ -2224,20 +2851,23 @@ process_exec_task_done( fd_replay_tile_t *          ctx,
         /* Every transaction in a valid block has to sigverify.
            Otherwise, we should mark the block as dead.  Also freeze the
            bank if possible. */
-        mark_bank_dead( ctx, stem, bank->idx );
+        mark_bank_dead( ctx, stem, bank->idx, FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_SIGVERIFY_FAILED );
         fd_sched_block_abandon( ctx->sched, bank->idx );
       }
       int res = fd_sched_task_done( ctx->sched, FD_SCHED_TT_TXN_SIGVERIFY, txn_idx, exec_tile_idx, NULL );
       FD_TEST( res==0 );
       if( FD_LIKELY( (txn_info->flags&FD_SCHED_TXN_REPLAY_DONE)==FD_SCHED_TXN_REPLAY_DONE ) ) {
-        publish_txn_executed( ctx, stem, txn_idx );
+        publish_txn_executed( ctx, stem, bank->idx, txn_idx );
       }
       break;
     }
     case FD_EXECRP_TT_POH_HASH: {
       int res = fd_sched_task_done( ctx->sched, FD_SCHED_TT_POH_HASH, ULONG_MAX, exec_tile_idx, msg->poh_hash );
       if( FD_UNLIKELY( res<0 && bank->state!=FD_BANK_STATE_DEAD ) ) {
-        mark_bank_dead( ctx, stem, bank->idx );
+        /* A negative task_done is not necessarily a PoH hash mismatch:
+           eager tick verification also runs on this path.  Query the
+           scheduler for the specific reason. */
+        mark_bank_dead( ctx, stem, bank->idx, sched_dead_reason_to_event( fd_sched_get_dead_reason( ctx->sched, bank->idx ) ) );
       }
       break;
     }
@@ -2396,6 +3026,33 @@ process_fec_complete( fd_replay_tile_t *  ctx,
        failed insert data to repair in after_credit. */
     fd_store_remove( ctx->store, merkle_root );
     return;
+  }
+
+  /* Stash the repair tile's forest snapshot (carried on the FEC-complete
+     message) onto the reasm FEC.  These survive until the slot is rooted
+     and reasm prunes, well past block completion, so the block_completed
+     telemetry event can read them off the slot-complete FEC. */
+  fec->fec_completed_ts_nanos = complete_msg->fec_completed_ts_nanos;
+  fec->stats_valid = complete_msg->stats_valid;
+  if( FD_LIKELY( complete_msg->stats_valid ) ) {
+    fec->blk_turbine_cnt         = complete_msg->blk_turbine_cnt;
+    fec->blk_repair_cnt          = complete_msg->blk_repair_cnt;
+    fec->blk_recovered_cnt       = complete_msg->blk_recovered_cnt;
+    fec->blk_data_cnt            = complete_msg->blk_data_cnt;
+    fec->blk_parity_cnt          = complete_msg->blk_parity_cnt;
+    fec->blk_lowest_verified_fec = complete_msg->blk_lowest_verified_fec;
+    fec->blk_chain_confirmed     = complete_msg->blk_chain_confirmed;
+    fec->blk_slot_complete       = complete_msg->blk_slot_complete;
+    fec->blk_req_window_cnt      = complete_msg->blk_req_window_cnt;
+    fec->blk_req_highest_cnt     = complete_msg->blk_req_highest_cnt;
+    fec->blk_req_orphan_cnt      = complete_msg->blk_req_orphan_cnt;
+    fec->blk_req_retransmit_cnt  = complete_msg->blk_req_retransmit_cnt;
+    fec->blk_repair_responses    = complete_msg->blk_repair_responses;
+    fec->blk_chain_verify_failed = complete_msg->blk_chain_verify_failed;
+    fec->blk_first_shred_ts_nanos = complete_msg->blk_first_shred_ts_nanos;
+    fec->blk_last_shred_ts_nanos  = complete_msg->blk_last_shred_ts_nanos;
+    fec->blk_first_req_ts_nanos   = complete_msg->blk_first_req_ts_nanos;
+    fec->blk_last_repair_resp_ts_nanos = complete_msg->blk_last_repair_resp_ts_nanos;
   }
 }
 
@@ -2960,6 +3617,9 @@ unprivileged_init( fd_topo_t const *      topo,
   void * vote_tracker_mem   = FD_SCRATCH_ALLOC_APPEND( l, fd_vote_tracker_align(),     fd_vote_tracker_footprint() );
   void * _capture_ctx       = FD_SCRATCH_ALLOC_APPEND( l, fd_capture_ctx_align(),      fd_capture_ctx_footprint() );
   void * dump_proto_ctx_mem = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_dump_proto_ctx_t), sizeof(fd_dump_proto_ctx_t) );
+  void * block_completed_ev = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_event_block_completed_t), sizeof(fd_event_block_completed_t) );
+  void * timing_slots_mem   = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_replay_txn_timing_t), FD_REPLAY_TXN_TIMING_SLOTS*FD_MAX_TXN_PER_SLOT*sizeof(fd_replay_txn_timing_t) );
+  void * timing_of_bank_mem = FD_SCRATCH_ALLOC_APPEND( l, alignof(ulong),                tile->replay.max_live_slots*sizeof(ulong) );
   void * block_dump_ctx     = NULL;
   if( FD_UNLIKELY( tile->replay.dump_block_to_pb ) ) {
     block_dump_ctx = FD_SCRATCH_ALLOC_APPEND( l, fd_block_dump_context_align(), fd_block_dump_context_footprint() );
@@ -2980,6 +3640,12 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->banks = fd_banks_join( fd_topo_obj_laddr( topo, banks_obj_id ) );
   FD_TEST( ctx->banks );
+
+  /* Shared leader txn timing tables (telemetry); absent when block
+     production is disabled. */
+  ctx->leader_txn_timing = NULL;
+  ulong ldr_tt_obj_id = fd_pod_query_ulong( topo->props, "ldr_tt", ULONG_MAX );
+  if( FD_LIKELY( ldr_tt_obj_id!=ULONG_MAX ) ) ctx->leader_txn_timing = fd_topo_obj_laddr( topo, ldr_tt_obj_id );
 
   ulong node_info_obj_id = fd_pod_query_ulong( topo->props, "node_info", ULONG_MAX );
   FD_TEST( node_info_obj_id!=ULONG_MAX );
@@ -3050,6 +3716,21 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->capture_ctx->solcap_start_slot = tile->replay.capture_start_slot;
     ctx->capture_ctx->capture_solcap = 1;
   }
+
+  /* Staging buffer for block_completed telemetry events.  Only useful
+     when an event link is wired (telemetry on), but always allocated to
+     keep the scratch layout fixed. */
+  ctx->block_completed_event = block_completed_ev;
+
+  /* Per-txn timing capture pool.  Slot contents are not zeroed (multiple
+     MiB each); correctness comes from timing_slot_cnt and per-entry writes. */
+  for( ulong i=0UL; i<FD_REPLAY_TXN_TIMING_SLOTS; i++ ) {
+    ctx->timing_slot_bank[ i ] = ULONG_MAX;
+    ctx->timing_slot_cnt [ i ] = 0UL;
+    ctx->timing_slots    [ i ] = (fd_replay_txn_timing_t *)timing_slots_mem + i*FD_MAX_TXN_PER_SLOT;
+  }
+  ctx->timing_slot_of_bank = timing_of_bank_mem;
+  for( ulong i=0UL; i<tile->replay.max_live_slots; i++ ) ctx->timing_slot_of_bank[ i ] = ULONG_MAX;
 
   ctx->dump_proto_ctx = NULL;
   if( FD_UNLIKELY( strcmp( "", tile->replay.dump_proto_dir ) ) ) {
@@ -3292,8 +3973,14 @@ during_housekeeping( fd_replay_tile_t * ctx ) {
 
 #include "../../disco/stem/fd_stem.c"
 
+static ulong
+max_event_sz( fd_topo_tile_t const * tile FD_PARAM_UNUSED ) {
+  return sizeof(fd_event_block_completed_t);
+}
+
 fd_topo_run_tile_t fd_tile_replay = {
   .name                     = "replay",
+  .max_event_sz             = max_event_sz,
   .populate_allowed_seccomp = populate_allowed_seccomp,
   .populate_allowed_fds     = populate_allowed_fds,
   .scratch_align            = scratch_align,

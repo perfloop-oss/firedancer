@@ -137,6 +137,13 @@ struct fd_microblock_trailer {
   ulong bank_seq;
 
   fd_txn_ns_dt_t txn_ns_dt;
+
+  /* Telemetry (block_completed txn_timing): tickcounts when the bank/exec
+     tile began executing this microblock (for a bundle, the bundle start)
+     and when its transaction finished committing (LONG_MAX if it never
+     executed).  Zero when unused (Frankendancer). */
+  long exec_start_ticks;
+  long exec_end_ticks;
 };
 typedef struct fd_microblock_trailer fd_microblock_trailer_t;
 
@@ -148,6 +155,17 @@ typedef struct fd_microblock_trailer fd_microblock_trailer_t;
 #define FD_PACK_END_SLOT_REASON_TIME          (1)
 #define FD_PACK_END_SLOT_REASON_MICROBLOCK    (2)
 #define FD_PACK_END_SLOT_REASON_LEADER_SWITCH (3)
+
+/* Fine-grained reason production ended, for telemetry.  Derived in
+   get_done_packing() by refining the coarse end_slot_reason with the
+   per-limit scheduling results.  Values mirror the block_completed event's
+   pack_end_reason variants (mapped to the event enum in replay). */
+#define FD_PACK_END_REASON_UNKNOWN          (0)
+#define FD_PACK_END_REASON_TIME             (1)
+#define FD_PACK_END_REASON_CU_LIMIT         (2)
+#define FD_PACK_END_REASON_DATA_LIMIT       (3)
+#define FD_PACK_END_REASON_MICROBLOCK_LIMIT (4)
+#define FD_PACK_END_REASON_LEADER_SWITCH    (5)
 
 struct fd_done_packing {
   ulong microblocks_in_slot;
@@ -162,6 +180,12 @@ struct fd_done_packing {
   fd_pack_smallest_t pending_votes_smallest[ 1 ];
 
   int end_slot_reason;
+
+  /* Telemetry summary for the block_completed event (leader blocks). */
+  int   end_reason_fine;     /* FD_PACK_END_REASON_*; refined end_slot_reason */
+  long  pack_start_ns;       /* wallclock ns production began for this slot */
+  long  pack_end_ns;         /* wallclock ns production ended for this slot */
+  ulong bundle_txn_count;    /* bundled txns scheduled into this block */
 };
 typedef struct fd_done_packing fd_done_packing_t;
 

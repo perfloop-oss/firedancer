@@ -81,6 +81,8 @@ typedef struct {
   ulong map_next;
   ulong map_prev;
 
+  long tsorig_ns; /* ingest wallclock; absolute because stash residency can exceed the tsorig window */
+
   blockhash_t * blockhash;
   uchar _[ FD_TPU_PARSED_MTU ] __attribute__((aligned(alignof(fd_txn_m_t))));
 } fd_stashed_txn_m_t;
@@ -350,9 +352,13 @@ publish_txn( fd_resolv_ctx_t *          ctx,
     if( FD_UNLIKELY( err ) ) return 0;
   }
 
+  /* Carry the ingest time in the payload: the txn may have sat in the
+     stash for longer than a compressed tsorig can represent. */
+  txnm->tpu_arrival_time_nanos = stashed->tsorig_ns;
+
   ulong realized_sz = fd_txn_m_realized_footprint( txnm, 1, 1 );
   ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
-  fd_stem_publish( stem, 0UL, txnm->reference_slot, ctx->out_pack->chunk, realized_sz, 0UL, 0UL, tspub );
+  fd_stem_publish( stem, 0UL, txnm->reference_slot, ctx->out_pack->chunk, realized_sz, 0UL, fd_frag_meta_ts_comp( stashed->tsorig_ns ), tspub );
   ctx->out_pack->chunk = fd_dcache_compact_next( ctx->out_pack->chunk, realized_sz, ctx->out_pack->chunk0, ctx->out_pack->wmark );
 
   return 1;
@@ -552,6 +558,10 @@ after_frag( fd_resolv_ctx_t *   ctx,
        pool_idx_acquire won't return POOL_IDX_NULL. */
     FD_COMPILER_FORGET( stash_txn );
     fd_memcpy( stash_txn->_, txnm, fd_txn_m_realized_footprint( txnm, 1, 0 ) );
+    /* Clamp: a stamp older than the ~2.1s decomp window aliases into the
+       future; pin it to now rather than future-date the arrival. */
+    long stash_now = fd_log_wallclock();
+    stash_txn->tsorig_ns = tsorig ? fd_long_min( fd_frag_meta_ts_decomp( tsorig, stash_now ), stash_now ) : 0L;
     stash_txn->blockhash = (blockhash_t *)(fd_txn_m_payload( (fd_txn_m_t *)(stash_txn->_) ) + txnt->recent_blockhash_off);
     ctx->metrics.stash[ FD_METRICS_ENUM_RESOLVE_STASH_OPERATION_V_INSERTED_IDX ]++;
 

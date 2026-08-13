@@ -488,6 +488,7 @@ fd_bundle_tile_publish_bundle_txn(
   fd_memcpy( entry->payload, txn, txn_sz );
   entry->payload_sz     = (ushort)txn_sz;
   entry->source_ipv4    = source_ipv4;
+  entry->ts             = fd_bundle_now();
   entry->sig            = 1UL;
   entry->bundle_seq     = ctx->bundle_seq;
   entry->bundle_txn_cnt = bundle_txn_cnt;
@@ -514,6 +515,7 @@ fd_bundle_tile_publish_txn(
   fd_memcpy( entry->payload, txn, txn_sz );
   entry->payload_sz     = (ushort)txn_sz;
   entry->source_ipv4    = source_ipv4;
+  entry->ts             = fd_bundle_now();
   entry->sig            = 0UL;
   entry->bundle_seq     = 0UL;
   entry->bundle_txn_cnt = 1UL;

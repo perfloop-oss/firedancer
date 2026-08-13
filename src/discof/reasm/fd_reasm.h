@@ -191,10 +191,37 @@ struct __attribute__((aligned(128UL))) fd_reasm_fec {
 
   /* Data (set by caller) */
 
-  ulong bank_dead;
+  ulong bank_dead;     /* 0: live; 1: dead lineage; 2: abandoned lineage (set by replay) */
+  ulong dead_reported; /* dead telemetry row already emitted for this block */
   ulong bank_idx;
   ulong bank_seq;
   ulong parent_bank_idx;
+
+  /* Block-level shred-receipt stats, set by the caller (replay) from the
+     repair tile's forest snapshot carried on the FEC-complete message.
+     Only final/meaningful on the slot-complete FEC; replay reads them off
+     that FEC when building the block_completed telemetry event.
+     stats_valid==0 means the snapshot was unavailable. */
+  ulong fec_completed_ts_nanos; /* network arrival (wallclock ns) of the shred completing this FEC set; 0 if unavailable */
+  uint  stats_valid;
+  uint  blk_turbine_cnt;
+  uint  blk_repair_cnt;
+  uint  blk_recovered_cnt;
+  uint  blk_data_cnt;
+  uint  blk_parity_cnt;
+  uint  blk_lowest_verified_fec;
+  uchar blk_chain_confirmed;
+  uchar blk_slot_complete;
+  uint  blk_req_window_cnt;
+  uint  blk_req_highest_cnt;
+  uint  blk_req_orphan_cnt;
+  uint  blk_req_retransmit_cnt;
+  uint  blk_repair_responses;
+  uchar blk_chain_verify_failed;
+  ulong blk_first_shred_ts_nanos;
+  ulong blk_last_shred_ts_nanos;
+  ulong blk_first_req_ts_nanos;
+  ulong blk_last_repair_resp_ts_nanos;
 };
 typedef struct fd_reasm_fec fd_reasm_fec_t;
 

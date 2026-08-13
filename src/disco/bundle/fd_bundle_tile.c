@@ -293,9 +293,10 @@ after_credit( fd_bundle_tile_t *  ctx,
       fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
       fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
 
-      ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
-      ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
-      fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+      ulong sz     = fd_txn_m_realized_footprint( txnm, 0, 0 );
+      ulong tsorig = (ulong)fd_frag_meta_ts_comp( txn->ts );
+      ulong tspub  = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
+      fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, tsorig, tspub );
       ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
 
       pending_txn_remove_head( ctx->pending_txns );

@@ -53,11 +53,35 @@ void
 fd_event_register( fd_topo_t const *      topo,
                    fd_topo_tile_t const * tile );
 
+/* Event frag sig encoding.  The frag meta sz field is a ushort, but events
+   can exceed 64 KiB (packed dynamic arrays), so the actual byte size rides
+   the sig alongside the schema type id:
+
+     sig = (event_sz << 8) | event_type
+
+   Type ids fit a byte; event sizes fit 56 bits trivially. */
+
+#define FD_EVENT_SIG( type, sz ) ( ((ulong)(sz)<<8) | ((ulong)(type)&0xFFUL) )
+#define FD_EVENT_SIG_TYPE( sig ) ( (ulong)(sig)&0xFFUL )
+#define FD_EVENT_SIG_SZ( sig )   ( (ulong)(sig)>>8 )
+
+/* One segment of a gathered (packed) event write: the fixed prefix or one
+   dynamic array's used entries. */
+
+struct fd_event_report_iov {
+  void const * base;
+  ulong        sz;
+};
+
+typedef struct fd_event_report_iov fd_event_report_iov_t;
+
 /* fd_event_report_ publishes a single event of sz bytes (the serialized
    fd_event_<name>_t struct) to the event link.  type is the event schema
-   id, carried in the frag sig so the event tile can dispatch.  No-op when
-   fd_event_tl is NULL.  The generated fd_event_report_<name>() macros call
-   this with the right type and sizeof. */
+   id, carried with the byte size in the frag sig (see FD_EVENT_SIG) so the
+   event tile can dispatch and size-validate; the frag sz field is too
+   narrow for large events and carries a clamped copy only.  No-op when
+   fd_event_tl is NULL.  The generated fd_event_report_<name>() helpers call
+   this with the right type and size. */
 
 static inline void
 fd_event_report_( ulong        type,
@@ -71,7 +95,35 @@ fd_event_report_( ulong        type,
   ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
 
   fd_memcpy( fd_chunk_to_laddr( r->mem, r->chunk ), event, sz );
-  fd_mcache_publish( r->mcache, r->depth, r->seq, type, r->chunk, sz, 0UL, 0UL, tspub );
+  fd_mcache_publish( r->mcache, r->depth, r->seq, FD_EVENT_SIG( type, sz ), r->chunk, fd_ulong_min( sz, (ulong)USHORT_MAX ), 0UL, 0UL, tspub );
+  r->seq   = fd_seq_inc( r->seq, 1UL );
+  r->chunk = fd_dcache_compact_next( r->chunk, sz, r->chunk0, r->wmark );
+  fd_mcache_seq_update( r->seq_store, r->seq );
+}
+
+/* fd_event_report_gather_ is fd_event_report_ for packed events: writes the
+   iov segments back to back into the dcache (fixed prefix followed by each
+   dynamic array's used entries) and publishes the total size. */
+
+static inline void
+fd_event_report_gather_( ulong                         type,
+                         fd_event_report_iov_t const * iov,
+                         ulong                         iov_cnt ) {
+  fd_event_reporter_t * r = fd_event_tl;
+  if( FD_UNLIKELY( !r ) ) return; /* no event link / telemetry off */
+
+  ulong sz = 0UL;
+  for( ulong i=0UL; i<iov_cnt; i++ ) sz += iov[ i ].sz;
+  FD_TEST( sz<=r->mtu );
+
+  ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+
+  uchar * dst = fd_chunk_to_laddr( r->mem, r->chunk );
+  for( ulong i=0UL; i<iov_cnt; i++ ) {
+    fd_memcpy( dst, iov[ i ].base, iov[ i ].sz );
+    dst += iov[ i ].sz;
+  }
+  fd_mcache_publish( r->mcache, r->depth, r->seq, FD_EVENT_SIG( type, sz ), r->chunk, fd_ulong_min( sz, (ulong)USHORT_MAX ), 0UL, 0UL, tspub );
   r->seq   = fd_seq_inc( r->seq, 1UL );
   r->chunk = fd_dcache_compact_next( r->chunk, sz, r->chunk0, r->wmark );
   fd_mcache_seq_update( r->seq_store, r->seq );

@@ -695,6 +695,7 @@ fd_reasm_init( fd_reasm_t *      reasm,
   fec->confirmed       = 0;
   fec->popped          = 0;
   fec->bank_dead       = 0;
+  fec->dead_reported   = 0;
   fec->bank_idx        = null;
   fec->parent_bank_idx = null;
   fec->bank_seq        = null;
@@ -809,6 +810,7 @@ fd_reasm_insert( fd_reasm_t *      reasm,
   fec->confirmed       = 0;
   fec->popped          = 0;
   fec->bank_dead       = 0;
+  fec->dead_reported   = 0;
   fec->bank_idx        = null;
   fec->parent_bank_idx = null;
   fec->bank_seq        = null;

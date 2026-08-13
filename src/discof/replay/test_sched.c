@@ -64,7 +64,8 @@ run_bad_tick_case( fd_hash_t const * start_poh,
                    ulong             max_tick_height,
                    ulong             hashes_per_tick,
                    int               expect_mark_dead,
-                   int               expect_poh_fail ) {
+                   int               expect_poh_fail,
+                   int               expect_dead_reason ) {
   /* This test only needs the root, the parent, the child under test, and
      one spare slot. */
   ulong depth         = fd_ulong_max( FD_SCHED_MIN_DEPTH, 512UL );
@@ -138,6 +139,7 @@ run_bad_tick_case( fd_hash_t const * start_poh,
 
   FD_TEST( seen_mark_dead==expect_mark_dead );
   FD_TEST( seen_poh_fail ==expect_poh_fail  );
+  FD_TEST( fd_sched_get_dead_reason( sched, 2UL )==expect_dead_reason );
   FD_TEST( fd_sched_is_drained( sched ) );
   while( fd_sched_pruned_block_next( sched )!=ULONG_MAX ) {}
 
@@ -152,17 +154,17 @@ run_bad_tick_cases( void ) {
 
   {
     ulong tick_hashcnt[ 1 ] = { 1UL };
-    run_bad_tick_case( start_poh, tick_hashcnt, 1UL, TEST_ROOT_TICK_HEIGHT + 2UL, 1UL, 1, 0 );
+    run_bad_tick_case( start_poh, tick_hashcnt, 1UL, TEST_ROOT_TICK_HEIGHT + 2UL, 1UL, 1, 0, FD_SCHED_DEAD_REASON_TOO_FEW_TICKS );
   }
 
   {
     ulong tick_hashcnt[ 2 ] = { 1UL, 1UL };
-    run_bad_tick_case( start_poh, tick_hashcnt, 2UL, TEST_ROOT_TICK_HEIGHT + 1UL, 1UL, 0, 1 );
+    run_bad_tick_case( start_poh, tick_hashcnt, 2UL, TEST_ROOT_TICK_HEIGHT + 1UL, 1UL, 0, 1, FD_SCHED_DEAD_REASON_TOO_MANY_TICKS );
   }
 
   {
     ulong tick_hashcnt[ 2 ] = { 1UL, 2UL };
-    run_bad_tick_case( start_poh, tick_hashcnt, 2UL, TEST_ROOT_TICK_HEIGHT + 2UL, 2UL, 0, 1 );
+    run_bad_tick_case( start_poh, tick_hashcnt, 2UL, TEST_ROOT_TICK_HEIGHT + 2UL, 2UL, 0, 1, FD_SCHED_DEAD_REASON_INVALID_TICK_HASH_COUNT );
   }
 }
 

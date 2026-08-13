@@ -31,6 +31,15 @@ struct fd_txn_m {
 
   /* 7 bytes of padding here */
 
+  /* Wallclock nanoseconds at which this transaction entered the
+     validator, or 0 if not carried here.  Producers normally leave this
+     zero and stamp the ingest time as the frag tsorig instead, which is
+     cheaper; but tsorig is a 32 bit compressed stamp that only survives
+     ~2.1s of transit, so a tile that holds a transaction longer than
+     that (the resolv blockhash stash) must carry the absolute value
+     here.  Pack prefers this field over tsorig when it is non-zero. */
+  long     tpu_arrival_time_nanos;
+
   struct {
     /* If the transaction is part of a bundle, the bundle_id will be
        non-zero, and if this transaction is the first one in the

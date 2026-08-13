@@ -337,8 +337,8 @@ fd_tpu_reasm_publish_fast( fd_tpu_reasm_t * reasm,
      the old slot */
   *pub_slot = slot_idx;
   ulong ctl         = fd_frag_meta_ctl( reasm->orig, 1, 1, 0 );
-  uint  tsorig_comp = slot->tsorig_comp;
   uint  tspub_comp  = (uint)fd_frag_meta_ts_comp( tspub );
+  uint  tsorig_comp = tspub_comp; /* single-call reassembly: arrival==publish */
 # if FD_HAS_AVX
   fd_mcache_publish_avx( mcache, depth, seq, 0UL, chunk, fd_txn_m_realized_footprint( txnm, 0, 0 ), ctl, tsorig_comp, tspub_comp );
 # elif FD_HAS_SSE

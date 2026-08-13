@@ -14,6 +14,6 @@ fd_gossip_tx_publish_chunk( fd_gossip_out_ctx_t * ctx,
                             long                  now ) {
   if( FD_UNLIKELY( ctx->chunk<ctx->chunk0 || ctx->chunk>ctx->wmark || sz>FD_NET_MTU ) )
     FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", ctx->chunk, sz, ctx->chunk0, ctx->wmark ));
-  fd_stem_publish( stem, ctx->idx, sig, ctx->chunk, sz, 0UL, 0UL, (ulong)now );
+  fd_stem_publish( stem, ctx->idx, sig, ctx->chunk, sz, 0UL, fd_frag_meta_ts_comp( now ), (ulong)now );
   ctx->chunk = fd_dcache_compact_next( ctx->chunk, sz, ctx->chunk0, ctx->wmark );
 }

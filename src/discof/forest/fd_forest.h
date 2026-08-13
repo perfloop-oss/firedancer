@@ -183,11 +183,25 @@ struct __attribute__((aligned(128UL))) fd_forest_blk {
   /* Metrics */
 
   fd_forest_blk_idxs_t code[fd_forest_blk_idxs_word_cnt]; /* code shred idxs */
-  long first_shred_ts; /* tick of first shred rcved in slot != complete_idx */
-  long first_req_ts;   /* tick of first request sent in slot != complete_idx */
+  long first_shred_ts;     /* tick of first shred rcved in slot != complete_idx */
+  long last_shred_ts;      /* tick at which the slot became fully buffered (buffered_idx==complete_idx) */
+  long first_req_ts;       /* tick of first request sent in slot != complete_idx */
+  long last_repair_resp_ts;/* tick of the most recent repair response received for this slot */
   uint turbine_cnt;    /* number of shreds received from turbine */
   uint repair_cnt;     /* number of data shreds received from repair */
   uint recovered_cnt;  /* number of shreds recovered from reedsol recovery */
+
+  /* Per-slot repair request/response tallies.  These mirror the global
+     repair metrics but attributed to this slot, so per-block telemetry
+     can report them.  Incremented by the policy when it dispatches a
+     request for this slot, and by the repair tile when a matching
+     response arrives. */
+  uint req_window_cnt;   /* window (specific-shred) requests sent for this slot */
+  uint req_highest_cnt;  /* highest-window requests sent for this slot */
+  uint req_orphan_cnt;   /* orphan requests sent for this slot */
+  uint req_retransmit_cnt; /* requests re-sent for this slot after a response timeout */
+  uint response_cnt;     /* repair responses received for this slot */
+  uchar chain_verify_failed; /* 1 if merkle chain verification flagged this block as the bad one */
 };
 typedef struct fd_forest_blk fd_forest_blk_t;
 
@@ -727,6 +741,11 @@ fd_forest_blk_insert( fd_forest_t * forest, ulong slot, ulong parent_slot, ulong
    sentinel block will update its parent with the first parent slot it
    receives, but it can be later updated with a data_shred_insert. */
 
+/* rx_tick is the fd_tickcount() at which the shred was received off the
+   network (as stamped by the shred tile and carried on the frag tsorig),
+   used for the block's first/last reception timestamps; pass 0 to stamp
+   with the insert time instead. */
+
 fd_forest_blk_t *
 fd_forest_data_shred_insert( fd_forest_t * forest,
                              ulong         slot,
@@ -737,10 +756,11 @@ fd_forest_data_shred_insert( fd_forest_t * forest,
                              int           ref_tick,
                              int           src,
                              fd_hash_t *   mr,
-                             fd_hash_t *   cmr );
+                             fd_hash_t *   cmr,
+                             long          rx_tick );
 
 fd_forest_blk_t *
-fd_forest_code_shred_insert( fd_forest_t * forest, ulong slot, uint shred_idx );
+fd_forest_code_shred_insert( fd_forest_t * forest, ulong slot, uint shred_idx, long rx_tick );
 
 /* fd_forest_fec_insert inserts a new fully completed FEC set into the
    forest. Assumes slot is already in forest, and should typically be
@@ -760,7 +780,8 @@ fd_forest_fec_insert( fd_forest_t * forest,
                       int           slot_complete,
                       int           ref_tick,
                       fd_hash_t *   mr,
-                      fd_hash_t *   cmr );
+                      fd_hash_t *   cmr,
+                      long          rx_tick );
 
 /* fd_forest_fec_clear clears the FEC set at the given slot and
    fec_set_idx.

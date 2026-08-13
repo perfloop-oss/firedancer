@@ -163,6 +163,10 @@ typedef struct {
 
   ulong pack_txn_cnt; /* total num transactions packed since startup */
 
+  /* Telemetry for the current leader slot (block_completed event). */
+  long  slot_pack_start_ns;  /* wallclock ns production began for leader_slot */
+  ulong slot_bundle_txn_cnt; /* bundled txns scheduled into leader_slot */
+
   /* The maximum number of microblocks that can be packed in this slot.
      Provided by the PoH tile when we become leader.*/
   ulong slot_max_microblocks;
@@ -253,6 +257,10 @@ typedef struct {
   fd_txn_e_t * extra_txn_deq;
   int          insert_to_extra; /* whether the last insert was into pack or the extra deq */
 #endif
+
+  /* Whether the last insert took its ingest stamp from the payload
+     rather than the frag tsorig. */
+  int          arrival_from_payload;
 
   fd_pack_in_ctx_t in[ 32 ];
   int              in_kind[ 32 ];
@@ -445,6 +453,33 @@ get_done_packing( fd_pack_ctx_t * ctx, fd_done_packing_t * done_packing, int rea
 #undef DELTA
 
   fd_pack_get_pending_smallest( ctx->pack, done_packing->pending_smallest, done_packing->pending_votes_smallest );
+
+  /* Telemetry summary for the block_completed event. */
+  done_packing->bundle_txn_count    = ctx->slot_bundle_txn_cnt;
+  done_packing->pack_start_ns       = ctx->slot_pack_start_ns;
+  done_packing->pack_end_ns         = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
+
+  /* Refine the coarse end_slot_reason into a fine telemetry reason.  Pack
+     only ends a block for three reasons: the slot's time window expired
+     (TIME, the normal case), the microblock cap was reached (MICROBLOCK),
+     or leadership moved on (LEADER_SWITCH).  Report what actually stopped
+     pack.
+
+     A block-level consensus limit (compute cost or data bytes) is more
+     informative than the coarse trigger, but ONLY when the block truly
+     saturated it (usage at/above the cap) — a real "couldn't fit more",
+     not a transient per-microblock defer.  We do not infer write-cost
+     here: it is a per-account limit, so block totals can't confirm it was
+     the binding block-end reason without false positives. */
+  int fine;
+  switch( reason ) {
+    case FD_PACK_END_SLOT_REASON_LEADER_SWITCH: fine = FD_PACK_END_REASON_LEADER_SWITCH;    break;
+    case FD_PACK_END_SLOT_REASON_MICROBLOCK:    fine = FD_PACK_END_REASON_MICROBLOCK_LIMIT; break;
+    default:                                    fine = FD_PACK_END_REASON_TIME;             break; /* FD_PACK_END_SLOT_REASON_TIME */
+  }
+  if(      FD_UNLIKELY( done_packing->limits_usage->block_cost       >= done_packing->limits->max_cost_per_block       ) ) fine = FD_PACK_END_REASON_CU_LIMIT;
+  else if( FD_UNLIKELY( done_packing->limits_usage->block_data_bytes >= done_packing->limits->max_data_bytes_per_block ) ) fine = FD_PACK_END_REASON_DATA_LIMIT;
+  done_packing->end_reason_fine = fine;
 }
 
 static inline void
@@ -576,6 +611,7 @@ insert_from_extra( fd_pack_ctx_t * ctx ) {
   spot->txnp->source_tpu  = insert->txnp->source_tpu;
   spot->txnp->source_ipv4 = insert->txnp->source_ipv4;
   spot->txnp->scheduler_arrival_time_nanos = insert->txnp->scheduler_arrival_time_nanos;
+  spot->txnp->tpu_arrival_time_nanos       = insert->txnp->tpu_arrival_time_nanos;
   extra_txn_deq_remove_head( ctx->extra_txn_deq );
 
   ulong blockhash_slot = insert->txnp->blockhash_slot;
@@ -766,6 +802,7 @@ after_credit( fd_pack_ctx_t *     ctx,
         bundle[0]->txnp->source_tpu  = FD_TXN_M_TPU_SOURCE_BUNDLE;
         bundle[0]->txnp->source_ipv4 = 0; /* not applicable */
         bundle[0]->txnp->scheduler_arrival_time_nanos = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
+        bundle[0]->txnp->tpu_arrival_time_nanos       = bundle[0]->txnp->scheduler_arrival_time_nanos; /* created here: origination time */
         memcpy( bundle[0]->txnp->payload+TXN(bundle[0]->txnp)->recent_blockhash_off, ctx->crank->recent_blockhash, 32UL );
 
         fd_keyguard_client_sign( ctx->crank->keyguard_client, bundle[0]->txnp->payload+1UL,
@@ -870,6 +907,7 @@ after_credit( fd_pack_ctx_t *     ctx,
       ctx->slot_microblock_cnt += fd_ulong_if( trailer->is_bundle, schedule_cnt, 1UL );
       ctx->pack_idx += fd_uint_if( trailer->is_bundle, (uint)schedule_cnt, 1U );
       ctx->pack_txn_cnt += schedule_cnt;
+      ctx->slot_bundle_txn_cnt += fd_ulong_if( trailer->is_bundle, schedule_cnt, 0UL );
 
       ctx->execle_idle_bitset = fd_ulong_pop_lsb( ctx->execle_idle_bitset );
       ctx->skip_cnt           = (long)schedule_cnt * fd_long_if( ctx->use_consumed_cus, (long)execle_cnt/2L, 1L );
@@ -1079,6 +1117,14 @@ during_frag( fd_pack_ctx_t * ctx,
     fd_memcpy( TXN(ctx->cur_spot->txnp),     txn,                      txn_t_sz      );
     fd_memcpy( ctx->cur_spot->alt_accts,     fd_txn_m_alut( txnm ),    addr_table_sz );
     ctx->cur_spot->txnp->scheduler_arrival_time_nanos = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
+    /* Prefer the payload stamp: it is absolute, so it survives producers
+       that held the txn longer than the tsorig window (resolv's stash).
+       Otherwise after_frag decompresses the frag tsorig over this
+       defensive pack-arrival value. */
+    ctx->arrival_from_payload = !!txnm->tpu_arrival_time_nanos;
+    ctx->cur_spot->txnp->tpu_arrival_time_nanos = fd_long_if( ctx->arrival_from_payload,
+                                                              txnm->tpu_arrival_time_nanos,
+                                                              ctx->cur_spot->txnp->scheduler_arrival_time_nanos );
     ctx->cur_spot->txnp->payload_sz  = payload_sz;
     ctx->cur_spot->txnp->source_ipv4 = source_ipv4;
     ctx->cur_spot->txnp->source_tpu  = source_tpu;
@@ -1108,7 +1154,6 @@ after_frag( fd_pack_ctx_t *     ctx,
             fd_stem_context_t * stem ) {
   (void)seq;
   (void)sz;
-  (void)tsorig;
   (void)tspub;
   (void)stem;
 
@@ -1159,6 +1204,10 @@ after_frag( fd_pack_ctx_t *     ctx,
       remove_ib( ctx );
     }
     ctx->leader_slot = leader_slot;
+
+    /* Telemetry: production begins now for this leader slot. */
+    ctx->slot_pack_start_ns  = now_ns;
+    ctx->slot_bundle_txn_cnt = 0UL;
 
     ulong exp_cnt = fd_pack_expire_before( ctx->pack, fd_ulong_max( ctx->leader_slot, TRANSACTION_LIFETIME_SLOTS )-TRANSACTION_LIFETIME_SLOTS );
     FD_MCNT_INC( PACK, TXN_EXPIRED, exp_cnt );
@@ -1246,6 +1295,20 @@ after_frag( fd_pack_ctx_t *     ctx,
     break;
   }
   case IN_KIND_RESOLV: {
+    /* The frag tsorig carries the transaction's ingest time (compressed
+       wallclock): network arrival for QUIC/UDP, block engine receipt
+       for bundles, gossip receipt for gossiped votes, origination time
+       for our own votes.  Every ingest path stamps it, so the
+       pack-arrival value set in during_frag is only defensive.  Skip it
+       when the payload carried an absolute stamp, which is authoritative
+       and may predate what tsorig can represent. */
+    if( FD_LIKELY( ctx->cur_spot && tsorig && !ctx->arrival_from_payload ) ) {
+      long now_ns = ctx->approx_wallclock_ns + (long)((double)(now - ctx->approx_tickcount) / ctx->ticks_per_ns);
+      /* A stamp older than the ~2.1s decomp window aliases into the
+         future; clamp to now rather than future-date the arrival. */
+      ctx->cur_spot->txnp->tpu_arrival_time_nanos = fd_long_min( fd_frag_meta_ts_decomp( tsorig, now_ns ), now_ns );
+    }
+
     /* Normal transaction case */
 #if FD_PACK_USE_EXTRA_STORAGE
     if( FD_LIKELY( !ctx->insert_to_extra ) ) {

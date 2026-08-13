@@ -20,6 +20,12 @@ struct __attribute__((aligned(64))) fd_txn_p {
   /* The time that the transaction arrived to the pack tile in ticks. Set by pack and intended to be read from a transaction on a pack->execle link. */
   long scheduler_arrival_time_nanos;
 
+  /* The wallclock time the transaction was received off the network (TPU
+     ingest, carried from the ingest tile's frag tsorig).  Falls back to
+     the pack arrival time when no ingest stamp was available (e.g.
+     internally generated transactions).  Set by pack; used by telemetry. */
+  long tpu_arrival_time_nanos;
+
   union {
     struct {
       /* set by replay scheduler for use by monitoring tools */

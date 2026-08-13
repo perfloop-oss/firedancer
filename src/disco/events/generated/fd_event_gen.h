@@ -32,7 +32,7 @@ typedef struct fd_event_signed_vote fd_event_signed_vote_t;
 
 /* Worst-case encoded size of a signed_vote event (envelope + Event
    submsg + inner submsg + all fields, padded for encoder slack). */
-#define FD_EVENT_SIGNED_VOTE_BUF_MAX (2765UL)
+#define FD_EVENT_SIGNED_VOTE_BUF_MAX (2780UL)
 
 /* The commitment level reached, from weakest to strongest: processed, propagated, duplicate, optimistic, super, rooted. ignored is a separate terminal outcome rather than a strengthening level. */
 #define FD_EVENT_SLOT_CONFIRMED_LEVEL_IGNORED    (1) /* Replay finished a block that consensus had already pruned, so it never reached any commitment level. */
@@ -45,7 +45,7 @@ typedef struct fd_event_signed_vote fd_event_signed_vote_t;
 
 /* A slot reached a commitment level. Emitted once per slot per level reached. Join to block_completed on bank_seq, or on slot and block_id. */
 struct fd_event_slot_confirmed {
-  ulong bank_seq;         /* Monotonic sequence number identifying this block within the current run; the join key to block_completed. Restarts at 1 each time a snapshot is loaded, so pair it with the stream's boot id. 0 means unavailable, which happens for forward confirmations where the block has not been replayed. */
+  ulong bank_seq;         /* Monotonic sequence number identifying this block within the current run; the join key to block_completed. Restarts at 1 each time a snapshot is loaded, so pair it with the stream's boot id. 0 means unavailable, which happens for forward confirmations where the block has not been replayed. The boot (snapshot or genesis) bank's confirmations carry bank_seq 1 but join to no block_completed row, since the boot block is not replayed. */
   ulong slot;             /* The slot being confirmed. */
   uchar block_id[ 32UL ]; /* Unique identifier of the block being confirmed; the join key to block_completed. */
   ulong stake;            /* Stake in lamports supporting this confirmation. Divide by total_stake for the ratio that crossed the level's threshold. 0 means unavailable. */
@@ -58,7 +58,7 @@ typedef struct fd_event_slot_confirmed fd_event_slot_confirmed_t;
 
 /* Worst-case encoded size of a slot_confirmed event (envelope + Event
    submsg + inner submsg + all fields, padded for encoder slack). */
-#define FD_EVENT_SLOT_CONFIRMED_BUF_MAX (221UL)
+#define FD_EVENT_SLOT_CONFIRMED_BUF_MAX (236UL)
 
 /* A single accounts-database partition finished compacting. Compaction scans one partition, relocates its still-live account records forward into the next storage tier, and reclaims the partition. Emitted once per partition per compaction pass by the accdb tile. Partitions are large (e.g. 32 GiB) so this is a rare, coarse-grained event rather than a hot-path counter. */
 struct fd_event_accdb_compaction_completed {
@@ -77,7 +77,7 @@ typedef struct fd_event_accdb_compaction_completed fd_event_accdb_compaction_com
 
 /* Worst-case encoded size of a accdb_compaction_completed event (envelope + Event
    submsg + inner submsg + all fields, padded for encoder slack). */
-#define FD_EVENT_ACCDB_COMPACTION_COMPLETED_BUF_MAX (237UL)
+#define FD_EVENT_ACCDB_COMPACTION_COMPLETED_BUF_MAX (252UL)
 
 /* The accounts database grew its backing file by one partition. The accounts DB is a single file divided into fixed-size partitions; when a write head runs off the end of the allocated file, a new partition is fallocated and the file grows. Emitted once per grow by the accdb tile. Partitions are large (e.g. 32 GiB) so grows are infrequent and each one is a meaningful step in the database's on-disk footprint. */
 struct fd_event_accdb_partition_added {
@@ -93,7 +93,7 @@ typedef struct fd_event_accdb_partition_added fd_event_accdb_partition_added_t;
 
 /* Worst-case encoded size of a accdb_partition_added event (envelope + Event
    submsg + inner submsg + all fields, padded for encoder slack). */
-#define FD_EVENT_ACCDB_PARTITION_ADDED_BUF_MAX (197UL)
+#define FD_EVENT_ACCDB_PARTITION_ADDED_BUF_MAX (212UL)
 
 /* How the equivocation was detected. */
 #define FD_EVENT_BLOCK_EQUIVOCATED_DETECTION_DUPLICATE_REPLAY (1) /* A second, different block for the slot finished replaying locally. */
@@ -122,7 +122,7 @@ typedef struct fd_event_block_equivocated fd_event_block_equivocated_t;
 
 /* Worst-case encoded size of a block_equivocated event (envelope + Event
    submsg + inner submsg + all fields, padded for encoder slack). */
-#define FD_EVENT_BLOCK_EQUIVOCATED_BUF_MAX (398UL)
+#define FD_EVENT_BLOCK_EQUIVOCATED_BUF_MAX (413UL)
 
 /* Transaction execution error */
 #define FD_EVENT_RUNTIME_TXN_TXN_ERR_SUCCESS                                 (1) /* Transaction succeeded */
@@ -283,11 +283,138 @@ typedef struct fd_event_runtime_txn fd_event_runtime_txn_t;
 
 /* Worst-case encoded size of a runtime_txn event (envelope + Event
    submsg + inner submsg + all fields, padded for encoder slack). */
-#define FD_EVENT_RUNTIME_TXN_BUF_MAX (23234UL)
+#define FD_EVENT_RUNTIME_TXN_BUF_MAX (23249UL)
+
+/* Why the block was ruled invalid; not_dead otherwise. Blocks this validator produced are never dead: they do not go through replay's block checks. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_NOT_DEAD                (1) /* Not ruled invalid. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_PARENT_DEAD             (2) /* The parent block was dead; the block cannot be replayed. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_BAD_BLOCK_PARSE         (3) /* Contents did not parse into valid transactions. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_BAD_BLOCK_TOO_MANY_TXNS (4) /* More transactions than a valid block can hold. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_TRAILING_ENTRY          (5) /* Block did not end on a tick; a transaction entry trailed the final tick. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_TOO_FEW_TICKS           (6) /* Fewer ticks than required. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_TOO_MANY_TICKS          (7) /* More ticks than allowed. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_INVALID_TICK_HASH_COUNT (8) /* Ticks did not contain the expected number of hashes. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_POH_HASH_MISMATCH       (9) /* Proof-of-history hash did not verify. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_SIGVERIFY_FAILED        (10) /* A transaction failed signature verification. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_TXN_FAILED_TO_LOAD      (11) /* A transaction could not be prepared for execution (e.g. account or fee load failure). */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_BLOCK_COST_LIMIT        (12) /* A transaction pushed the block over its compute limit. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_ACCOUNT_COST_LIMIT      (13) /* A transaction pushed one account over its per-block compute limit. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_VOTE_COST_LIMIT         (14) /* A vote transaction pushed the block over its vote compute limit. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_ACCOUNT_DATA_LIMIT      (15) /* A transaction pushed the block over its account data size limit. */
+#define FD_EVENT_BLOCK_COMPLETED_DEAD_REASON_DUPLICATE_ACCOUNT       (16) /* A transaction referenced the same account more than once. */
+
+/* Why replay stopped before the block completed; not_abandoned otherwise. Independent of dead. Only replayed blocks can be abandoned; blocks this validator produced always complete. */
+#define FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_NOT_ABANDONED (1) /* Not abandoned; the block completed or was ruled invalid. */
+#define FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_PRUNED        (2) /* A block on another fork was rooted, discarding this fork before replay finished. */
+#define FD_EVENT_BLOCK_COMPLETED_ABANDONED_REASON_EVICTED       (3) /* Dropped for lack of room to track in-progress blocks. May be replayed later, producing a second, completed row. */
+
+/* Why block production stopped; not_leader for blocks this validator did not produce. */
+#define FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_NOT_LEADER       (1) /* Not produced by this validator. */
+#define FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_TIME             (2) /* The leader slot's time window ended. */
+#define FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_CU_LIMIT         (3) /* Compute unit limit reached. */
+#define FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_DATA_LIMIT       (4) /* Size (data bytes) limit reached. */
+#define FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_MICROBLOCK_LIMIT (5) /* Microblock count limit reached. */
+#define FD_EVENT_BLOCK_COMPLETED_PACK_END_REASON_LEADER_SWITCH    (6) /* Leadership moved on, possibly before any microblock was packed. */
+
+/* Timestamps for one transaction. A zero timestamp means the stage did not occur on this path or was never reached. */
+struct fd_event_block_completed_txn_timing {
+  ulong received_time;             /* Earliest time attributable to the transaction. Replayed blocks: network arrival of the shred completing the FEC set carrying the transaction; gap to parsed_time is the internal latency to parse. Leader blocks: entry into this validator — TPU network arrival, block engine receipt (bundles), gossip receipt (votes), or creation time (self-originated). */
+  ulong dispatched_time;           /* Replayed blocks: when the scheduler handed the transaction to an execution tile. Leader blocks: when an execution tile began executing it; transactions of one bundle share the stamp. */
+  ulong replayed_time;             /* When execution finished and results were committed to the block's state, on whichever path executed it. */
+  ulong parsed_time;               /* When the scheduler parsed the transaction out of received data, including address lookup table resolution. Gap from received_time covers the pipeline hop, in-order delivery waits, and parse position within the FEC set. 0 for leader blocks. */
+  ulong sigverify_dispatched_time; /* When the scheduler dispatched signature verification, which runs in parallel with execution. 0 for leader blocks (verified upstream of pack). */
+  ulong sigverify_done_time;       /* When the signature verification result returned to the scheduler. 0 for leader blocks. */
+  ulong poh_mixed_time;            /* When the transaction was mixed into the PoH stream, fixing its position in the block; transactions of one microblock share the stamp. 0 for blocks this validator did not produce. */
+};
+typedef struct fd_event_block_completed_txn_timing fd_event_block_completed_txn_timing_t;
+
+/* A block finished production, or replay on this validator, or was marked dead, or was abandoned before completing. On-chain data is deliberately not part of this event. */
+struct fd_event_block_completed {
+  ulong                                 bank_seq;                                  /* Bank sequence number, counting from 1 within a run; the join key to confirmation events. Not meaningful across restarts. 0 means no bank was ever allocated (block dropped as the child of a dead parent), leaving nothing to join on bank_seq; any forward confirmations for such a block join on slot and block_id. The boot bank (bank_seq 1) emits confirmation events but no block_completed row. */
+  ulong                                 slot;                                      /* Slot number of the block. */
+  ulong                                 epoch;                                     /* Epoch containing the slot. */
+  ulong                                 parent_slot;                               /* Slot number of the parent block. 0 if the parent was no longer locally known when the row was emitted. */
+  ulong                                 root_slot;                                 /* Finalized root slot when the row was emitted. */
+  ulong                                 storage_slot;                              /* Lowest slot still held in memory when the row was emitted. */
+  uchar                                 block_id[ 32UL ];                          /* Block identifier. For blocks that never completed reception (dead or abandoned early): the merkle root of the latest piece received. */
+  uchar                                 bank_hash[ 32UL ];                         /* Bank hash computed by replaying the block; the state commitment consensus votes on. Rows sharing slot and block_id but differing here indicate state divergence. 0 if the block never froze (dead or abandoned). */
+  int                                   dead;                                      /* Whether the block was ruled invalid. Blocks merely given up on are not dead; see abandoned_reason. State accumulated before the ruling is still reported, so execution fields may be partially filled. */
+  int                                   dead_reason;                               /* Why the block was ruled invalid; not_dead otherwise. Blocks this validator produced are never dead: they do not go through replay's block checks. */
+  ulong                                 dead_time;                                 /* When the block was ruled invalid; 0 if not dead. */
+  int                                   abandoned;                                 /* Whether replay stopped before the block completed. Independent of dead: an abandoned block was not invalid. Equivalent to abandoned_reason != not_abandoned. State accumulated before abandonment is still reported, so execution fields may be partially filled. */
+  int                                   abandoned_reason;                          /* Why replay stopped before the block completed; not_abandoned otherwise. Independent of dead. Only replayed blocks can be abandoned; blocks this validator produced always complete. */
+  ulong                                 abandoned_time;                            /* When the block was abandoned; 0 if not abandoned. */
+  int                                   is_leader;                                 /* Whether this validator produced the block as leader. */
+  ulong                                 first_shred_received_time;                 /* Network arrival at the shred tile of the block's first shred, stamped before signature verification. Leader blocks: when the first entry batch reached the shredding stage, before any network send. 0 if repair pruned the block before completion. */
+  ulong                                 last_shred_received_time;                  /* Network arrival of the shred that made the block contiguous; not necessarily the highest-numbered shred. Minus first_shred_received_time: reception duration. Leader blocks: when the final entry batch reached the shredding stage. 0 if repair pruned the block before completion. */
+  ulong                                 first_repair_request_time;                 /* First repair request for a specific missing shred (window request); highest-shred and orphan requests do not stamp this, so it can be 0 while their request counts are not. 0 if no window request was sent or repair pruned the block; always 0 for leader blocks. */
+  ulong                                 last_repair_received_time;                 /* Arrival of the last repair response matched to an outstanding specific-shred request; shreds from highest-shred and orphan responses do not stamp this. 0 if none was matched or repair pruned the block; always 0 for leader blocks. */
+  ulong                                 first_fec_set_received_time;               /* When the block's first complete FEC set reached replay, after verification and reassembly. Minus first_shred_received_time: internal pipeline latency from network to replay. Leader blocks: when the block's own first FEC set returned to replay through reassembly; follows rather than precedes preparation_begin_time, since production shreds the block as it goes. 0 if no bank was ever allocated. */
+  ulong                                 preparation_begin_time;                    /* When replay began setting up the block's execution state: cloning from the parent and applying start-of-block updates (epoch boundary processing, fee and rent state). Follows first_fec_set_received_time. Gap to first_transaction_scheduled_time: setup cost, which for leader blocks includes waiting for pack to schedule the first transaction. 0 if the block was dropped before setup. */
+  ulong                                 first_transaction_scheduled_time;          /* When replay dispatched the block's first transaction to an execution tile. Leader blocks: when an execution tile began the first packed transaction. Execution runs from here to last_transaction_finished_time; equal to it if the block executed no transactions or, for leader blocks, if production timing was unavailable (see txn_timing). */
+  ulong                                 last_transaction_finished_time;            /* When the final transaction's execution result returned to replay and end-of-block processing began. Leader blocks: when the block was fully produced (final PoH hash received, block id returned through reassembly), trailing the last execution result by the PoH tail and final-entry shredding, most when a limit ended the block early. 0 if the block never finished executing (dead or abandoned). */
+  ulong                                 block_completed_time;                      /* When end-of-block processing finished and the block froze: state hashing complete, no further changes. Minus last_transaction_finished_time: finalization cost. 0 if the block never completed (dead or abandoned). */
+  ulong                                 parent_block_completed_time;               /* The parent's block_completed_time, denormalized to avoid a self-join. 0 if the parent's completion was never observed: parent untracked, parent never froze (dead or abandoned lineage), or the block chains directly off the snapshot or genesis boot bank. */
+  ulong                                 fec_set_count;                             /* Number of FEC sets in the block; for blocks that never completed reception, the number received when the row was emitted. 0 if reassembly no longer tracked the block when the row was emitted. */
+  uint                                  data_shred_count;                          /* Data shreds received or recovered. Leader blocks: shreds produced. 0 if repair pruned the block before completion. */
+  uint                                  parity_shred_count;                        /* Parity (recovery) shreds received. 0 if repair pruned the block before completion. */
+  uint                                  turbine_shred_count;                       /* Shreds received over the network via turbine. Near 0 for leader blocks. 0 if repair pruned the block before completion. */
+  uint                                  repair_shred_count;                        /* Shreds obtained from peers via repair. Always 0 for leader blocks. 0 if repair pruned the block before completion. */
+  uint                                  recovered_shred_count;                     /* Shreds reconstructed locally from parity data. Always 0 for leader blocks, which produce rather than recover their shreds. 0 if repair pruned the block before completion. */
+  int                                   chain_confirmed;                           /* Whether every FEC set was verified to chain back to the confirmed block identity, i.e. the assembled data matches the block the cluster confirmed. Verification is confirmation-triggered and the value is snapshotted at the block's last received FEC set, so false means it had not run by then, not that it failed; at the live tip confirmation usually arrives later. True mainly when confirmation precedes reception completing, e.g. during catch-up. See lowest_verified_fec_index. */
+  uint                                  lowest_verified_fec_index;                 /* Lowest FEC set index reached by chain verification as of the block's last received FEC set; the walk anchors at the confirmed block identity and works backwards. 0 means the whole block verified. 4294967295 means no verification information (verification never ran, or repair pruned the block); not a FEC index. */
+  int                                   slot_complete_flag;                        /* Whether the shred marking the block complete was received. False if repair pruned the block before completion. */
+  int                                   equivocation_detected_shred;               /* Whether conflicting shreds were detected for the slot. */
+  uint                                  repair_requests_retransmitted;             /* Repair requests re-sent after a response timeout. Always 0 for leader blocks. 0 if repair pruned the block before completion. */
+  uint                                  repair_responses_received;                 /* Repair responses matched to an outstanding specific-shred request. Shreds delivered by highest-shred and orphan responses count in repair_shred_count but are not matched here, so this can be 0 while repair_shred_count is not. Always 0 for leader blocks. 0 if repair pruned the block before completion. */
+  uint                                  repair_request_window_count;               /* Repair requests for one specific missing shred, by index. Always 0 for leader blocks. 0 if repair pruned the block before completion. */
+  uint                                  repair_request_highest_window_count;       /* Repair requests for the highest-numbered shred a peer holds, used to learn the block's length. Always 0 for leader blocks. 0 if repair pruned the block before completion. */
+  uint                                  repair_request_orphan_count;               /* Repair requests for the block's ancestry when its parent is unknown; a response carries shreds from up to 11 ancestor blocks. Always 0 for leader blocks. 0 if repair pruned the block before completion. */
+  int                                   repair_failed_chain_verify;                /* Whether chain verification against the confirmed block identity found a mismatched (wrong-version) FEC held for this block; the piece was cleared and re-repaired, but may have arrived by any route, turbine included. Always false for leader blocks. False if repair pruned the block before completion. */
+  ulong                                 cost_tracker_block_cost;                   /* Compute units used by all transactions, votes included. Before remove_simple_vote_from_cost_model activates, non-vote usage is this minus cost_tracker_vote_cost; afterward the split is not derivable from this event. 0 if no cost tracker existed for the block (never prepared for replay, or no bank). */
+  ulong                                 cost_tracker_vote_cost;                    /* Compute units used by vote transactions. Reads 0 once the remove_simple_vote_from_cost_model feature activates, which folds votes into the general costing. Also 0 if no cost tracker existed for the block. */
+  ulong                                 cost_tracker_allocated_accounts_data_size; /* New account data allocated, in bytes. 0 if no cost tracker existed for the block. */
+  ulong                                 cost_tracker_block_cost_limit;             /* Block compute unit limit. 0 if no cost tracker existed for the block (never prepared for replay, or no bank). */
+  ulong                                 cost_tracker_vote_cost_limit;              /* Block vote compute unit limit. 0 if no cost tracker existed for the block. */
+  ulong                                 cost_tracker_account_cost_limit;           /* Per-account compute unit limit. 0 if no cost tracker existed for the block. */
+  ulong                                 became_leader_time;                        /* When replay began block production for the slot, all prerequisites (e.g. parent block identity) in hand. Minus leader_slot_start_time: local production start delay. 0 for blocks this validator did not produce. */
+  ulong                                 leader_slot_start_time;                    /* When the leader slot was scheduled to begin, estimated locally by projecting slot durations from the reset onto the parent fork; embeds upstream lateness rather than tracking a cluster-absolute timeline. 0 for blocks this validator did not produce. */
+  ulong                                 pack_start_time;                           /* When block production began. 0 for blocks this validator did not produce. */
+  ulong                                 pack_end_time;                             /* When block production ended. 0 for blocks this validator did not produce. */
+  ulong                                 microblock_count;                          /* Microblocks pack scheduled during production. A microblock whose transactions all failed execution is skipped at PoH mixin and absent from the block, so this can exceed block content. 0 for blocks this validator did not produce. */
+  ulong                                 pack_block_cost;                           /* Compute units pack reserved while building the block, votes included. Reservations are refunded as transactions finish, so this can exceed cost_tracker_block_cost (the charged amount) by refunds unsettled at slot end. 0 for blocks this validator did not produce. */
+  ulong                                 pack_vote_cost;                            /* Vote compute units pack reserved while building the block; can exceed cost_tracker_vote_cost by refunds unsettled at slot end. Pack's vote costing is not feature-gated, so this stays populated after remove_simple_vote_from_cost_model zeroes cost_tracker_vote_cost. 0 for blocks this validator did not produce. */
+  ulong                                 pack_data_bytes;                           /* Bytes pack's cost model reserved for block content: transaction payloads plus a 48-byte header per microblock, net of rebates settled by slot end. Excludes tick entries; can exceed the block's actual content by rebates unsettled at slot end. A size, not a compute measure. 0 for blocks this validator did not produce. */
+  int                                   pack_end_reason;                           /* Why block production stopped; not_leader for blocks this validator did not produce. */
+  ulong                                 bundle_txn_count;                          /* Bundled transactions pack scheduled during production, counted whether or not the bundle survived to the block (aborted bundles are skipped at PoH mixin). 0 for blocks this validator did not produce. */
+  ulong                                 txn_timing_cnt;                            /* Number of txn_timing entries (<= 98039) */
+  fd_event_block_completed_txn_timing_t txn_timing[ 98039UL ];                     /* Per-transaction timestamps, one entry per transaction in block order. Replayed blocks: stamped by the replay scheduler. Leader blocks: stamped by the production pipeline. Columns exclusive to the other path are 0. Always empty on dead or abandoned rows; otherwise best-effort: empty when no capture slot was free (more than 16 blocks replaying at once) or the production timing table was unavailable. Empty does not mean the block had no transactions. (dynamic: stored at end, shipped at used length) */
+};
+typedef struct fd_event_block_completed fd_event_block_completed_t;
+
+#define FD_EVENT_BLOCK_COMPLETED_PREFIX_SZ (offsetof(fd_event_block_completed_t, txn_timing))
+
+#define FD_EVENT_BLOCK_COMPLETED_TXN_TIMING_MAX (98039UL)
+
+FD_STATIC_ASSERT( sizeof(((fd_event_block_completed_t *)0)->txn_timing[0])%8UL==0UL, block_completed_txn_timing_align );
+
+/* Packed (wire) footprint of a block_completed event: prefix plus used
+   dynamic array entries.  msg may point at a full struct or at a
+   packed event's prefix. */
+static inline ulong
+fd_event_block_completed_footprint( fd_event_block_completed_t const * msg ) {
+  return FD_EVENT_BLOCK_COMPLETED_PREFIX_SZ
+       + msg->txn_timing_cnt*sizeof(((fd_event_block_completed_t *)0)->txn_timing[0])
+       ;
+}
+
+/* Worst-case encoded size of a block_completed event (envelope + Event
+   submsg + inner submsg + all fields, padded for encoder slack). */
+#define FD_EVENT_BLOCK_COMPLETED_BUF_MAX (11275373UL)
 
 /* Largest generated event struct; a consumer can stage any incoming
    event in a buffer of this size. */
-#define FD_EVENT_GEN_STRUCT_MAX (( sizeof(fd_event_runtime_txn_t) > ( sizeof(fd_event_block_equivocated_t) > ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ? sizeof(fd_event_block_equivocated_t) : ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ) ? sizeof(fd_event_runtime_txn_t) : ( sizeof(fd_event_block_equivocated_t) > ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ? sizeof(fd_event_block_equivocated_t) : ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ) ))
+#define FD_EVENT_GEN_STRUCT_MAX (( sizeof(fd_event_block_completed_t) > ( sizeof(fd_event_runtime_txn_t) > ( sizeof(fd_event_block_equivocated_t) > ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ? sizeof(fd_event_block_equivocated_t) : ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ) ? sizeof(fd_event_runtime_txn_t) : ( sizeof(fd_event_block_equivocated_t) > ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ? sizeof(fd_event_block_equivocated_t) : ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ) ) ? sizeof(fd_event_block_completed_t) : ( sizeof(fd_event_runtime_txn_t) > ( sizeof(fd_event_block_equivocated_t) > ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ? sizeof(fd_event_block_equivocated_t) : ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ) ? sizeof(fd_event_runtime_txn_t) : ( sizeof(fd_event_block_equivocated_t) > ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ? sizeof(fd_event_block_equivocated_t) : ( sizeof(fd_event_accdb_partition_added_t) > ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ? sizeof(fd_event_accdb_partition_added_t) : ( sizeof(fd_event_accdb_compaction_completed_t) > ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ? sizeof(fd_event_accdb_compaction_completed_t) : ( sizeof(fd_event_slot_confirmed_t) > sizeof(fd_event_signed_vote_t) ? sizeof(fd_event_slot_confirmed_t) : sizeof(fd_event_signed_vote_t) ) ) ) ) ) ))
 
 FD_PROTOTYPES_BEGIN
 
@@ -351,6 +478,16 @@ fd_event_runtime_txn_serialize( fd_circq_t *                   circq,
                                 ulong                          link_seq,
                                 fd_event_runtime_txn_t const * msg );
 
+/* Serialize a block_completed event into the circq, reserving an event id
+   from the client and writing the standard event envelope.  Mirrors
+   the hand-written fd_pb_* path. */
+void
+fd_event_block_completed_serialize( fd_circq_t *                       circq,
+                                    fd_event_client_t *                client,
+                                    long                               timestamp_nanos,
+                                    ulong                              link_seq,
+                                    fd_event_block_completed_t const * msg );
+
 /* Serialize an event of the given type id (the schema id carried in the
    report frag's sig) from a fully-formed fd_event_<name>_t at ev. */
 void
@@ -402,6 +539,20 @@ fd_event_report_block_equivocated( fd_event_block_equivocated_t const * msg ) {
 static inline void
 fd_event_report_runtime_txn( fd_event_runtime_txn_t const * msg ) {
   fd_event_report_( 8UL, msg, sizeof(fd_event_runtime_txn_t) );
+}
+
+/* Report a block_completed event (BlockCompleted, id 9) to the event tile via
+   the thread-local reporter (no-op when the tile has no event link).
+   The event travels packed: fixed prefix followed by the used entries
+   of each dynamic array. */
+static inline void
+fd_event_report_block_completed( fd_event_block_completed_t const * msg ) {
+  FD_TEST( msg->txn_timing_cnt<=98039UL );
+  fd_event_report_iov_t iov[] = {
+    { (void const *)msg, FD_EVENT_BLOCK_COMPLETED_PREFIX_SZ },
+    { (void const *)msg->txn_timing, msg->txn_timing_cnt*sizeof(msg->txn_timing[0]) },
+  };
+  fd_event_report_gather_( 9UL, iov, sizeof(iov)/sizeof(iov[0]) );
 }
 
 FD_PROTOTYPES_END

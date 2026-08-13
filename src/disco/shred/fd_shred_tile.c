@@ -1229,6 +1229,10 @@ after_frag( fd_shred_ctx_t *    ctx,
       complete_msg->last_shred_hdr = *last;
       memcpy( &complete_msg->merkle_root, ctx->out_merkle_roots[fset_k].hash, sizeof(fd_hash_t) );
       complete_msg->chained_merkle_root = *(fd_hash_t *)fd_type_pun((uchar *)last + fd_shred_chain_off( last->variant ));
+      /* The shred tile has no forest; repair fills the telemetry stats
+         when it forwards this message to replay. */
+      complete_msg->stats_valid            = 0U;
+      complete_msg->fec_completed_ts_nanos = 0UL;
 
       fd_stem_publish( stem, ctx->shred_out_idx, sig, ctx->shred_out_chunk, sizeof(fd_fec_complete_t), 0UL, ctx->tsorig, fd_frag_meta_ts_comp( fd_tickcount() ) );
       ctx->shred_out_chunk = fd_dcache_compact_next( ctx->shred_out_chunk, sizeof(fd_fec_complete_t), ctx->shred_out_chunk0, ctx->shred_out_wmark );

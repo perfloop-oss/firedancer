@@ -77,6 +77,9 @@ struct fd_sched_fec {
                                            parser should ignore trailing bytes at the end of a batch. */
   uint             is_last_in_block:1;  /* Set if this is the last FEC set in the block. */
   uint             is_first_in_block:1; /* Set if this is the first FEC set in the block.  Bank should increment refcnt for sched if such a FEC set has been ingested by sched. */
+  long             completed_ts_nanos;  /* Network arrival (wallclock ns) of the shred that completed this
+                                           FEC set; 0 if unavailable.  Attributed to transactions parsed out
+                                           of this FEC set as the earliest time their bytes were known. */
 
   fd_sched_alut_ctx_t alut_ctx[ 1 ];
 };
@@ -92,6 +95,7 @@ typedef struct fd_sched_fec fd_sched_fec_t;
 struct fd_sched_txn_info {
    ulong flags;
    int   txn_err;
+   long  received_ns;  /* wallclock, network arrival of the FEC set completing this txn's bytes; 0 if unavailable */
    long  tick_parsed;
    long  tick_sigverify_disp;
    long  tick_sigverify_done;
@@ -152,8 +156,24 @@ struct fd_sched_poh_hash {
 };
 typedef struct fd_sched_poh_hash fd_sched_poh_hash_t;
 
+/* FD_SCHED_DEAD_REASON_* enumerates why the scheduler ruled a block
+   invalid.  Recorded on the block when it is ruled dead; query with
+   fd_sched_get_dead_reason. */
+
+#define FD_SCHED_DEAD_REASON_NONE                    (0) /* Block was not ruled invalid by the scheduler. */
+#define FD_SCHED_DEAD_REASON_BAD_BLOCK_PARSE         (1) /* Block contents could not be parsed. */
+#define FD_SCHED_DEAD_REASON_TOO_MANY_TXNS           (2) /* More transactions than a valid block can hold. */
+#define FD_SCHED_DEAD_REASON_TRAILING_ENTRY          (3) /* Block did not end on a tick. */
+#define FD_SCHED_DEAD_REASON_TOO_FEW_TICKS           (4) /* Fewer ticks than required. */
+#define FD_SCHED_DEAD_REASON_TOO_MANY_TICKS          (5) /* More ticks than allowed. */
+#define FD_SCHED_DEAD_REASON_INVALID_TICK_HASH_COUNT (6) /* Ticks did not have the expected hash count. */
+#define FD_SCHED_DEAD_REASON_POH_HASH_MISMATCH       (7) /* Proof-of-history hash did not verify. */
+#define FD_SCHED_DEAD_REASON_DUPLICATE_ACCOUNT       (8) /* Transaction referenced the same account more than once. */
+#define FD_SCHED_DEAD_REASON_DEAD_ANCESTOR           (9) /* An ancestor of the block was ruled invalid. */
+#define FD_SCHED_DEAD_REASON_ABANDONED_ANCESTOR      (10) /* An ancestor of the block was abandoned (fork discarded), not ruled invalid. */
+
 struct fd_sched_mark_dead {
-  ulong     bank_idx;
+  ulong bank_idx;
 };
 typedef struct fd_sched_mark_dead fd_sched_mark_dead_t;
 
@@ -297,7 +317,9 @@ fd_sched_task_next_ready( fd_sched_t * sched, fd_sched_task_t * out );
    the effects of the execution are now visible on any core that could
    execute a subsequent transaction.  Returns 0 on success, -1 if given
    the result of the task, the block turns out to be bad.  -1 is only
-   returned from PoH tasks.
+   returned from PoH tasks.  A -1 return does not imply a PoH hash
+   mismatch: eager tick verification also runs on this path.  Query
+   fd_sched_get_dead_reason for the specific reason.
 
    If a block has been abandoned or marked dead for any reason, it'll be
    pruned the moment in-flight task count hits 0 due to the last task
@@ -334,6 +356,18 @@ fd_sched_task_done( fd_sched_t * sched, ulong task_type, ulong txn_idx, ulong ex
    said bank.  Then the bank_idx may be recycled for another block. */
 void
 fd_sched_block_abandon( fd_sched_t * sched, ulong bank_idx );
+
+/* fd_sched_get_dead_reason returns the scheduler's reason (one of
+   FD_SCHED_DEAD_REASON_*) for why the block at bank_idx was ruled
+   invalid.  Returns FD_SCHED_DEAD_REASON_NONE if the scheduler did not
+   rule it invalid (e.g. it was marked dead by the replay tile for an
+   execution/sigverify failure or frontier eviction) or if no block is
+   currently tracked at bank_idx.  The recorded reason is the first
+   reason the block was ruled invalid for; later failures on an
+   already-dead block (e.g. an in-flight PoH task draining after the
+   block was abandoned) do not overwrite it. */
+int
+fd_sched_get_dead_reason( fd_sched_t * sched, ulong bank_idx );
 
 /* Prune the given block including descendants of it. */
 void
@@ -375,7 +409,10 @@ void
 fd_sched_set_poh_params( fd_sched_t * sched, ulong bank_idx, ulong tick_height, ulong max_tick_height, ulong hashes_per_tick, fd_hash_t const * start_poh );
 
 /* fd_sched_block_verify_ticks sets the tick window and verifies
-   ticks on bank_idx (shred fuzz harness, no exec); 0 if valid. */
+   ticks on bank_idx (shred fuzz harness, no exec).  Returns
+   FD_SCHED_DEAD_REASON_NONE (0) if valid, else the
+   FD_SCHED_DEAD_REASON_* the ticks are invalid for.  Does not rule the
+   block invalid; the caller decides what to do with the verdict. */
 int
 fd_sched_block_verify_ticks( fd_sched_t * sched,
                              ulong        bank_idx,

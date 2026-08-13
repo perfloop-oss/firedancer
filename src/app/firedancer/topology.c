@@ -1,5 +1,6 @@
 #include "topology.h"
 
+#include "../../tango/dcache/fd_dcache.h"
 #include "../../discof/poh/fd_poh.h"
 #include "../../discof/replay/fd_execrp.h"
 #include "../../discof/genesis/fd_genesi_tile.h"
@@ -62,7 +63,27 @@ wire_event_links( fd_topo_t * topo ) {
     char link_name[ sizeof(((fd_topo_link_t *)0)->name) ];
     FD_TEST( fd_cstr_printf_check( link_name, sizeof(link_name), NULL, "%s_event", tile->name ) );
 
-    fd_topo_link_t * link = fd_topob_link( topo, link_name, "event_in", 128UL, max_sz, 1UL );
+    /* Events with dynamic arrays travel packed at their used size, so the
+       dcache is a compact ring where typical events consume only their
+       actual footprint; the multi-MiB link MTU is a worst-case bound, not
+       the per-event cost.
+
+       Spend the memory budget on depth rather than undersizing the data
+       region.  The region has to hold every frag the mcache can still
+       reference: a consumer's sequence check catches a recycled mcache
+       entry, not recycled payload bytes, so a region smaller than
+       depth*MTU lets a producer clobber a payload whose mcache entry
+       still looks valid, and the torn read goes undetected.  So trade
+       depth away instead: big-MTU events get a shallow ring, small ones
+       keep the full 128.  The link is unreliable, and dropping whole
+       events is far better than shipping torn ones.  Consequence: replay
+       (multi-MiB MTU) lands at depth 8, so burst emitters there (e.g.
+       the prune sweep at root advance) are best-effort under load. */
+    ulong const event_link_dcache_max = 64UL<<20; /* 64 MiB data region per event link */
+    ulong depth = 128UL;
+    while( depth>1UL && fd_dcache_req_data_sz( max_sz, depth, 1UL, 1 )>event_link_dcache_max ) depth >>= 1;
+
+    fd_topo_link_t * link = fd_topob_link( topo, link_name, "event_in", depth, max_sz, 1UL );
     link->permit_no_producers = 1; /* written outside fd_stem; topo sees no producer */
 
     tile->event_link_id = link->id;
@@ -947,6 +968,16 @@ fd_topo_initialize( config_t * config ) {
   if( FD_UNLIKELY( config->firedancer.runtime.max_fork_width>FD_COLLECTOR_OVERRIDES_MAX_FORK_WIDTH ) ) {
     FD_LOG_ERR(( "max_fork_width must not exceed %lu", FD_COLLECTOR_OVERRIDES_MAX_FORK_WIDTH ));
   }
+
+  /* Shared per-txn timing tables for leader blocks (block_completed
+     telemetry): poh writes in mix order, replay reads on slot end. */
+  if( leader_enabled ) {
+    fd_topo_obj_t * ldr_tt_obj = fd_topob_obj( topo, "ldr_tt", "poh" );
+    fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "poh",    0UL ) ], ldr_tt_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "replay", 0UL ) ], ldr_tt_obj, FD_SHMEM_JOIN_MODE_READ_ONLY  );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, ldr_tt_obj->id, "ldr_tt" ) );
+  }
+
   fd_topo_obj_t * banks_obj = setup_topo_banks( topo, "banks", config->firedancer.runtime.max_live_slots, config->firedancer.runtime.max_fork_width, config->development.bench.larger_max_cost_per_block );
   /**/                 fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "replay", 0UL ) ], banks_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   /**/                 fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "tower",  0UL ) ], banks_obj, FD_SHMEM_JOIN_MODE_READ_ONLY  );

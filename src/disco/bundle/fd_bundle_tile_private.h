@@ -24,6 +24,7 @@ struct fd_bundle_pending_txn {
   uchar  payload[ FD_TXN_MTU ];
   ushort payload_sz;
   uint   source_ipv4;
+  long   ts; /* wallclock receipt time from the block engine */
   ulong  sig;
   ulong  bundle_seq;
   ulong  bundle_txn_cnt;

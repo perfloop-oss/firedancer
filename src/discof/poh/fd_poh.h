@@ -307,6 +307,7 @@
         N-2 to N-1. For mainnet-beta, the slots per epoch is fixed and
         will always be 420,000. */
 
+#include "../../disco/fd_disco_base.h"
 #include "../../disco/pack/fd_pack.h"
 #include "../../disco/stem/fd_stem.h"
 #include "../../disco/fd_clock_tile.h"
@@ -347,10 +348,61 @@
    569,424 or more prior slots. */
 #define MAX_SKIPPED_TICKS (1UL+(FD_PACK_MAX_DATA_PER_BLOCK/48UL))
 
+/* Per-transaction lifecycle timing for a leader block, captured by poh in
+   mix order (== block order) for the block_completed telemetry event's
+   txn_timing[] array.  Written by the poh tile, read by the replay tile via
+   a shared "ldr_tt" topology object holding FD_LEADER_TXN_TIMING_TABLE_CNT
+   tables; poh alternates tables per leader slot.  The reliable poh_replay
+   slot-ended publish is the release barrier for the writes: replay reads
+   the table while completing the leader block, strictly before poh can
+   begin another leader slot (replay cannot become leader again until the
+   current leader block completes), and reuse of the same table requires
+   two more leader slots. */
+
+struct fd_leader_txn_timing_rec {
+  long received_ns;       /* wallclock ns, txn TPU ingest (pack arrival if no ingest stamp) */
+  long dispatched_ticks;  /* TSC, exec tile began executing */
+  long replayed_ticks;    /* TSC, commit finished (LONG_MAX if never executed) */
+  long poh_mixed_ticks;   /* TSC, mixed into PoH */
+};
+
+typedef struct fd_leader_txn_timing_rec fd_leader_txn_timing_rec_t;
+
+FD_STATIC_ASSERT( sizeof(fd_leader_txn_timing_rec_t)==32UL, leader_txn_timing_rec );
+
+struct fd_leader_txn_timing_table {
+  ulong slot; /* leader slot the records describe, ULONG_MAX if none */
+  ulong cnt;  /* records filled, in block order */
+  fd_leader_txn_timing_rec_t rec[ FD_MAX_TXN_PER_SLOT ];
+};
+
+typedef struct fd_leader_txn_timing_table fd_leader_txn_timing_table_t;
+
+#define FD_LEADER_TXN_TIMING_TABLE_CNT (2UL)
+
 struct fd_poh_leader_slot_ended {
   int   completed;
   ulong slot;
   uchar blockhash[ 32UL ];
+
+  /* Which shared timing table (see fd_leader_txn_timing_table_t) holds the
+     per-transaction timing for this slot; ULONG_MAX if unavailable. */
+  ulong timing_table_idx;
+
+  /* Leader block-production summary for the block_completed telemetry
+     event, aggregated by poh from the pack done_packing message plus poh's
+     own reset state.  A completed leader slot is only reached after pack's
+     done_packing arrives (PoH reserves the final microblock for it and
+     asserts !max_remaining_microblocks on tick-out), so this is always
+     populated when the slot-ended message is sent for a produced block. */
+  ulong microblock_count;
+  ulong pack_block_cost;
+  ulong pack_vote_cost;
+  ulong pack_data_bytes;
+  ulong bundle_txn_count;
+  int   pack_end_reason; /* FD_PACK_END_REASON_* */
+  long  pack_start_ns;   /* wallclock ns production began */
+  long  pack_end_ns;     /* wallclock ns production ended */
 };
 
 typedef struct fd_poh_leader_slot_ended fd_poh_leader_slot_ended_t;
@@ -445,6 +497,26 @@ struct __attribute__((aligned(FD_POH_ALIGN))) fd_poh_private {
   fd_poh_out_t shred_out[ 1 ];
   fd_poh_out_t replay_out[ 1 ];
 
+  /* Telemetry summary for the current leader slot, captured from the pack
+     done_packing message and forwarded to replay in the slot-ended
+     message.  Always populated before the slot-ended message is sent for a
+     produced block (see note on the slot-ended struct). */
+  ulong pack_microblock_count;
+  ulong pack_block_cost;
+  ulong pack_vote_cost;
+  ulong pack_data_bytes;
+  ulong pack_bundle_txn_count;
+  int   pack_end_reason;
+  long  pack_start_ns;
+  long  pack_end_ns;
+
+  /* Shared per-transaction timing tables (see fd_leader_txn_timing_table_t
+     above), or NULL when the topology does not provide them (unit tests,
+     Frankendancer).  timing_table_idx selects the table for the current
+     leader slot; poh alternates per leader slot. */
+  fd_leader_txn_timing_table_t * timing_tables;
+  ulong                          timing_table_idx;
+
   ulong magic;
 };
 
@@ -464,7 +536,8 @@ fd_poh_new( void * shmem );
 fd_poh_t *
 fd_poh_join( void *         shpoh,
              fd_poh_out_t * shred_out,
-             fd_poh_out_t * replay_out );
+             fd_poh_out_t * replay_out,
+             void *         timing_tables ); /* fd_leader_txn_timing_table_t[FD_LEADER_TXN_TIMING_TABLE_CNT] or NULL */
 
 void
 fd_poh_reset( fd_poh_t *          poh,
@@ -504,19 +577,39 @@ void
 fd_poh_done_packing( fd_poh_t * poh,
                      ulong      microblocks_in_slot );
 
+/* fd_poh_set_pack_summary stashes the pack done_packing telemetry summary
+   for the current leader slot, to be forwarded to replay in the slot-ended
+   message.  Leader-only. */
+void
+fd_poh_set_pack_summary( fd_poh_t * poh,
+                         ulong      microblock_count,
+                         ulong      pack_block_cost,
+                         ulong      pack_vote_cost,
+                         ulong      pack_data_bytes,
+                         ulong      bundle_txn_count,
+                         int        pack_end_reason,
+                         long       pack_start_ns,
+                         long       pack_end_ns );
+
 void
 fd_poh_advance( fd_poh_t *          poh,
                 fd_stem_context_t * stem,
                 int *               opt_poll_in,
                 int *               charge_busy );
 
+/* timing is an optional (may be NULL) template record whose
+   constructed/dispatched/replayed stamps are copied into the shared timing
+   table for every txn of the microblock included in the block; received
+   and poh_mixed are filled per-txn / at mix time. */
+
 void
-fd_poh1_mixin( fd_poh_t *          poh,
-               fd_stem_context_t * stem,
-               ulong               slot,
-               uchar const *       hash,
-               ulong               txn_cnt,
-               fd_txn_p_t const *  txns );
+fd_poh1_mixin( fd_poh_t *                         poh,
+               fd_stem_context_t *                stem,
+               ulong                              slot,
+               uchar const *                      hash,
+               ulong                              txn_cnt,
+               fd_txn_p_t const *                 txns,
+               fd_leader_txn_timing_rec_t const * timing );
 
 void
 fd_poh_wfs_done( fd_poh_t * poh );

@@ -92,7 +92,8 @@ fd_poh_new( void * shmem ) {
 fd_poh_t *
 fd_poh_join( void *         shpoh,
              fd_poh_out_t * shred_out,
-             fd_poh_out_t * replay_out ) {
+             fd_poh_out_t * replay_out,
+             void *         timing_tables ) {
   if( FD_UNLIKELY( !shpoh ) ) {
     FD_LOG_WARNING(( "NULL shpoh" ));
     return NULL;
@@ -113,6 +114,15 @@ fd_poh_join( void *         shpoh,
   *poh->shred_out = *shred_out;
   *poh->replay_out = *replay_out;
 
+  poh->timing_tables    = (fd_leader_txn_timing_table_t *)timing_tables;
+  poh->timing_table_idx = 0UL;
+  if( FD_LIKELY( poh->timing_tables ) ) {
+    for( ulong i=0UL; i<FD_LEADER_TXN_TIMING_TABLE_CNT; i++ ) {
+      poh->timing_tables[ i ].slot = ULONG_MAX;
+      poh->timing_tables[ i ].cnt  = 0UL;
+    }
+  }
+
   return poh;
 }
 
@@ -129,6 +139,20 @@ transition_to_follower( fd_poh_t *          poh,
     dst->completed = completed_leader_slot;
     dst->slot      = poh->slot-1UL;
     fd_memcpy( dst->blockhash, poh->hash, 32UL );
+
+    /* Forward the leader block-production summary for telemetry.  A
+       completed leader slot is only reached after done_packing, so the
+       summary is always populated here. */
+    dst->microblock_count    = poh->pack_microblock_count;
+    dst->pack_block_cost     = poh->pack_block_cost;
+    dst->pack_vote_cost      = poh->pack_vote_cost;
+    dst->pack_data_bytes     = poh->pack_data_bytes;
+    dst->bundle_txn_count    = poh->pack_bundle_txn_count;
+    dst->pack_end_reason     = poh->pack_end_reason;
+    dst->pack_start_ns       = poh->pack_start_ns;
+    dst->pack_end_ns         = poh->pack_end_ns;
+    dst->timing_table_idx    = poh->timing_tables ? poh->timing_table_idx : ULONG_MAX;
+
     ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
     fd_stem_publish( stem, poh->replay_out->idx, 0UL, poh->replay_out->chunk, sizeof(fd_poh_leader_slot_ended_t), 0UL, 0UL, tspub );
     poh->replay_out->chunk = fd_dcache_compact_next( poh->replay_out->chunk, sizeof(fd_poh_leader_slot_ended_t), poh->replay_out->chunk0, poh->replay_out->wmark );
@@ -248,6 +272,15 @@ fd_poh_begin_leader( fd_poh_t * poh,
   poh->microblocks_lower_bound = 0UL;
   poh->leader_slot_start_ns    = slot_start_ns;
 
+  /* Rotate to the alternate timing table for this leader slot so replay can
+     still be reading the previous slot's table while we fill this one. */
+  if( FD_LIKELY( poh->timing_tables ) ) {
+    poh->timing_table_idx ^= 1UL;
+    fd_leader_txn_timing_table_t * table = &poh->timing_tables[ poh->timing_table_idx ];
+    table->slot = slot;
+    table->cnt  = 0UL;
+  }
+
   FD_LOG_INFO(( "begin_leader(slot=%lu, last_slot=%lu, last_hashcnt=%lu)", slot, poh->last_slot, poh->last_hashcnt ));
 }
 
@@ -304,6 +337,26 @@ fd_poh_done_packing( fd_poh_t * poh,
                                 + (poh->max_microblocks_per_slot-1UL) /* the canonical microblock limit */
                                 - microblocks_in_slot /* the actual microblock count */;
   FD_TEST( poh->microblocks_lower_bound==poh->max_microblocks_per_slot );
+}
+
+void
+fd_poh_set_pack_summary( fd_poh_t * poh,
+                         ulong      microblock_count,
+                         ulong      pack_block_cost,
+                         ulong      pack_vote_cost,
+                         ulong      pack_data_bytes,
+                         ulong      bundle_txn_count,
+                         int        pack_end_reason,
+                         long       pack_start_ns,
+                         long       pack_end_ns ) {
+  poh->pack_microblock_count= microblock_count;
+  poh->pack_block_cost      = pack_block_cost;
+  poh->pack_vote_cost       = pack_vote_cost;
+  poh->pack_data_bytes      = pack_data_bytes;
+  poh->pack_bundle_txn_count= bundle_txn_count;
+  poh->pack_end_reason      = pack_end_reason;
+  poh->pack_start_ns        = pack_start_ns;
+  poh->pack_end_ns          = pack_end_ns;
 }
 
 static void
@@ -695,12 +748,13 @@ publish_microblock( fd_poh_t *          poh,
 }
 
 void
-fd_poh1_mixin( fd_poh_t *          poh,
-               fd_stem_context_t * stem,
-               ulong               slot,
-               uchar const *       hash,
-               ulong               txn_cnt,
-               fd_txn_p_t const *  txns ) {
+fd_poh1_mixin( fd_poh_t *                         poh,
+               fd_stem_context_t *                stem,
+               ulong                              slot,
+               uchar const *                      hash,
+               ulong                              txn_cnt,
+               fd_txn_p_t const *                 txns,
+               fd_leader_txn_timing_rec_t const * timing ) {
   if( FD_UNLIKELY( slot!=poh->next_leader_slot || slot!=poh->slot ) ) {
     FD_LOG_ERR(( "packed too early or late slot=%lu, current_slot=%lu", slot, poh->slot ));
   }
@@ -724,8 +778,26 @@ fd_poh1_mixin( fd_poh_t *          poh,
   /* We don't publish transactions that fail to execute.  If all the
      transactions failed to execute, the microblock would be empty,
      causing agave to think it's a tick and complain.  Instead, we just
-     skip the microblock and don't hash or update the hashcnt. */
+     skip the microblock and don't hash or update the hashcnt.  Skipped
+     microblocks consume no txn timing records, matching block content. */
   if( FD_UNLIKELY( !executed_txn_cnt ) ) return;
+
+  /* Telemetry: record per-txn lifecycle timing, in mix order (== block
+     order).  One record per txn included in the block; txns of the same
+     microblock share the caller-provided constructed/dispatched/replayed
+     stamps. */
+  if( FD_LIKELY( poh->timing_tables && timing ) ) {
+    fd_leader_txn_timing_table_t * table = &poh->timing_tables[ poh->timing_table_idx ];
+    long poh_mixed_ticks = fd_tickcount();
+    for( ulong i=0UL; i<txn_cnt; i++ ) {
+      if( FD_UNLIKELY( !(txns[ i ].flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) ) ) continue;
+      if( FD_UNLIKELY( table->cnt>=FD_MAX_TXN_PER_SLOT ) ) break; /* can't happen: protocol max */
+      fd_leader_txn_timing_rec_t * rec = &table->rec[ table->cnt++ ];
+      *rec = *timing;
+      rec->received_ns     = txns[ i ].tpu_arrival_time_nanos;
+      rec->poh_mixed_ticks = poh_mixed_ticks;
+    }
+  }
 
   uchar data[ 64 ];
   fd_memcpy( data, poh->hash, 32UL );
